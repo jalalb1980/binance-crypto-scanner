@@ -5,13 +5,11 @@ from datetime import datetime
 
 # === Use ENV variables for security ===
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_USER_ID = int(os.getenv("TELEGRAM_USER_ID"))  # must be an integer
+TELEGRAM_USER_ID = int(os.getenv("TELEGRAM_USER_ID"))  # must be numeric
 
-print(f"Loaded TOKEN: {bool(TELEGRAM_BOT_TOKEN)}, USER_ID: {TELEGRAM_USER_ID}")
-
-THRESHOLD = 0.5  # % movement threshold
-INTERVAL = '15m'  # Binance interval (e.g., '15m', '1h', '3h')
-SLEEP_INTERVAL = 600  # 10 minutes in seconds
+THRESHOLD = 0.1           # Lower threshold to force test results
+INTERVAL = '15m'          # Short interval for more activity
+SLEEP_INTERVAL = 600      # 10 minutes
 
 # === Telegram Sender ===
 async def send_telegram(session, message):
@@ -23,7 +21,7 @@ async def send_telegram(session, message):
         payload = {
             "chat_id": TELEGRAM_USER_ID,
             "text": chunk,
-            "parse_mode": "Markdown"
+            "parse_mode": "Markdown"  # To support *bold*, `code`, etc.
         }
         async with session.post(url, data=payload) as res:
             if res.status != 200:
@@ -38,7 +36,7 @@ async def fetch_symbols(session, url, filter_fn):
 def is_spot_usdt(s): return s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING'
 def is_futures_usdt(s): return s['quoteAsset'] == 'USDT' and s.get('contractType') == 'PERPETUAL'
 
-# === Fetch Price Changes ===
+# === Price Change Calculation ===
 async def fetch_change(session, symbol, is_futures):
     base = "https://fapi.binance.com" if is_futures else "https://api.binance.com"
     path = "/fapi/v1/klines" if is_futures else "/api/v3/klines"
@@ -61,66 +59,66 @@ async def fetch_change(session, symbol, is_futures):
         print(f"⚠️ {symbol} error: {e}")
     return None
 
-# === Group and Sort Movers ===
+# === Group Gainers/Losers ===
 async def scan_market(session, symbols, is_futures):
     tasks = [fetch_change(session, sym, is_futures) for sym in symbols]
     results = await asyncio.gather(*tasks)
 
     gainers = sorted(
         [r for r in results if r and r[0] == "gainer"],
-        key=lambda x: x[1],
-        reverse=True
+        key=lambda x: x[1], reverse=True
     )
     losers = sorted(
         [r for r in results if r and r[0] == "loser"],
-        key=lambda x: x[1],
-        reverse=True
+        key=lambda x: x[1], reverse=True
     )
 
     return [g[2] for g in gainers], [l[2] for l in losers]
 
-# === Full Scanner Execution ===
+# === Full Scanner ===
 async def run_scan():
     async with aiohttp.ClientSession() as session:
-        await send_telegram(session, "✅ Test message from scanner bot.")
         print(f"\n🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC - Starting scan...")
 
+        # TEMPORARY TEST MESSAGE
+        await send_telegram(session, "✅ Test message from scanner bot.")
+
+        # Fetch all symbols
         spot_symbols, futures_symbols = await asyncio.gather(
             fetch_symbols(session, "https://api.binance.com/api/v3/exchangeInfo", is_spot_usdt),
             fetch_symbols(session, "https://fapi.binance.com/fapi/v1/exchangeInfo", is_futures_usdt)
         )
 
+        # Scan both markets
         (spot_gainers, spot_losers), (futures_gainers, futures_losers) = await asyncio.gather(
             scan_market(session, spot_symbols, is_futures=False),
             scan_market(session, futures_symbols, is_futures=True)
         )
 
-        print(f"📊 Spot: {len(spot_gainers)} gainers, {len(spot_losers)} losers")
-        print(f"📈 Futures: {len(futures_gainers)} gainers, {len(futures_losers)} losers")
+        print(f"📊 Spot - Gainers: {len(spot_gainers)}, Losers: {len(spot_losers)}")
+        print(f"📈 Futures - Gainers: {len(futures_gainers)}, Losers: {len(futures_losers)}")
 
-        # === Format Spot Message ===
+        # === Spot Message ===
         if spot_gainers or spot_losers:
-            message = f"*📊 Spot Movers (±{THRESHOLD}% in {INTERVAL}):*\n\n"
+            message = f"📊 *Spot Movers (±{THRESHOLD}% in {INTERVAL}):*\n\n"
             if spot_gainers:
                 message += "*🚀 Gainers:*\n" + "\n".join(spot_gainers) + "\n\n"
             if spot_losers:
                 message += "*📉 Losers:*\n" + "\n".join(spot_losers)
             await send_telegram(session, message)
         else:
-            print("✅ No Spot movers found.")
+            await send_telegram(session, "✅ Scan completed — no Spot movers found.")
 
-        # === Format Futures Message ===
+        # === Futures Message ===
         if futures_gainers or futures_losers:
-            message = f"*📈 Futures Movers (±{THRESHOLD}% in {INTERVAL}):*\n\n"
+            message = f"📈 *Futures Movers (±{THRESHOLD}% in {INTERVAL}):*\n\n"
             if futures_gainers:
                 message += "*🚀 Gainers:*\n" + "\n".join(futures_gainers) + "\n\n"
             if futures_losers:
                 message += "*📉 Losers:*\n" + "\n".join(futures_losers)
             await send_telegram(session, message)
         else:
-            print("✅ No Futures movers found.")
-
-        print("✅ Scan complete.")
+            await send_telegram(session, "✅ Scan completed — no Futures movers found.")
 
 # === Loop Forever ===
 async def main():
@@ -129,9 +127,8 @@ async def main():
             await run_scan()
         except Exception as e:
             print("🚨 Error during scan:", e)
-        print(f"⏱ Sleeping for {SLEEP_INTERVAL // 60} minutes...\n")
+        print(f"✅ Sleeping for {SLEEP_INTERVAL // 60} minutes...\n")
         await asyncio.sleep(SLEEP_INTERVAL)
 
-# === Start the Bot ===
 if __name__ == "__main__":
     asyncio.run(main())
