@@ -7,7 +7,7 @@ from datetime import datetime
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_USER_ID = int(os.getenv("TELEGRAM_USER_ID"))  # must be numeric
 
-THRESHOLD = 0.1           # Lower threshold to force test results
+THRESHOLD = 0.05           # Lower threshold to force test results
 INTERVAL = '15m'          # Short interval for more activity
 SLEEP_INTERVAL = 600      # 10 minutes
 
@@ -31,7 +31,7 @@ async def send_telegram(session, message):
 async def fetch_symbols(session, url, filter_fn):
     async with session.get(url) as res:
         data = await res.json()
-        return [s['symbol'] for s in data['symbols'] if filter_fn(s)][:200]
+        return [s['symbol'] for s in data['symbols'] if filter_fn(s)]
 
 def is_spot_usdt(s): return s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING'
 def is_futures_usdt(s): return s['quoteAsset'] == 'USDT' and s.get('contractType') == 'PERPETUAL'
