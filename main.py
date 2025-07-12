@@ -5,10 +5,10 @@ from datetime import datetime
 
 # === Use ENV variables for security ===
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")  # should be numeric string
+TELEGRAM_USER_ID = int(os.getenv("TELEGRAM_USER_ID"))  # must be an integer
 
 THRESHOLD = 0.5  # % movement threshold
-INTERVAL = '1h'  # Binance interval (e.g., '1h', '3h')
+INTERVAL = '1h'  # Binance interval (e.g., '15m', '1h', '3h')
 SLEEP_INTERVAL = 600  # 10 minutes in seconds
 
 # === Telegram Sender ===
@@ -20,8 +20,8 @@ async def send_telegram(session, message):
     for chunk in chunks:
         payload = {
             "chat_id": TELEGRAM_USER_ID,
-            "text": chunk
-            # remove "parse_mode"
+            "text": chunk,
+            "parse_mode": "Markdown"
         }
         async with session.post(url, data=payload) as res:
             if res.status != 200:
@@ -92,9 +92,12 @@ async def run_scan():
             scan_market(session, futures_symbols, is_futures=True)
         )
 
+        print(f"📊 Spot: {len(spot_gainers)} gainers, {len(spot_losers)} losers")
+        print(f"📈 Futures: {len(futures_gainers)} gainers, {len(futures_losers)} losers")
+
         # === Format Spot Message ===
         if spot_gainers or spot_losers:
-            message = f"📊 *Spot Movers (±{THRESHOLD}% in {INTERVAL}):*\n\n"
+            message = f"*📊 Spot Movers (±{THRESHOLD}% in {INTERVAL}):*\n\n"
             if spot_gainers:
                 message += "*🚀 Gainers:*\n" + "\n".join(spot_gainers) + "\n\n"
             if spot_losers:
@@ -105,7 +108,7 @@ async def run_scan():
 
         # === Format Futures Message ===
         if futures_gainers or futures_losers:
-            message = f"📈 *Futures Movers (±{THRESHOLD}% in {INTERVAL}):*\n\n"
+            message = f"*📈 Futures Movers (±{THRESHOLD}% in {INTERVAL}):*\n\n"
             if futures_gainers:
                 message += "*🚀 Gainers:*\n" + "\n".join(futures_gainers) + "\n\n"
             if futures_losers:
@@ -114,6 +117,8 @@ async def run_scan():
         else:
             print("✅ No Futures movers found.")
 
+        print("✅ Scan complete.")
+
 # === Loop Forever ===
 async def main():
     while True:
@@ -121,7 +126,7 @@ async def main():
             await run_scan()
         except Exception as e:
             print("🚨 Error during scan:", e)
-        print(f"✅ Sleeping for {SLEEP_INTERVAL // 60} minutes...\n")
+        print(f"⏱ Sleeping for {SLEEP_INTERVAL // 60} minutes...\n")
         await asyncio.sleep(SLEEP_INTERVAL)
 
 # === Start the Bot ===
