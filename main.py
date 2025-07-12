@@ -7,8 +7,10 @@ from datetime import datetime
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_USER_ID = int(os.getenv("TELEGRAM_USER_ID"))  # must be an integer
 
+print(f"Loaded TOKEN: {bool(TELEGRAM_BOT_TOKEN)}, USER_ID: {TELEGRAM_USER_ID}")
+
 THRESHOLD = 0.5  # % movement threshold
-INTERVAL = '1h'  # Binance interval (e.g., '15m', '1h', '3h')
+INTERVAL = '15m'  # Binance interval (e.g., '15m', '1h', '3h')
 SLEEP_INTERVAL = 600  # 10 minutes in seconds
 
 # === Telegram Sender ===
@@ -80,6 +82,7 @@ async def scan_market(session, symbols, is_futures):
 # === Full Scanner Execution ===
 async def run_scan():
     async with aiohttp.ClientSession() as session:
+        await send_telegram(session, "✅ Test message from scanner bot.")
         print(f"\n🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC - Starting scan...")
 
         spot_symbols, futures_symbols = await asyncio.gather(
