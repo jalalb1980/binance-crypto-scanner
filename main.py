@@ -79,6 +79,7 @@ async def scan_market(session, symbols, is_futures):
 # === Scan and Send ===
 async def run_scan():
     async with aiohttp.ClientSession() as session:
+        await send_telegram(session, "📢 Test message from Binance scanner — Telegram is working!")
         print(f"\n🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC - Starting scan...")
 
         spot_symbols, futures_symbols = await asyncio.gather(
