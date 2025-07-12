@@ -7,8 +7,8 @@ from datetime import datetime
 TELEGRAM_BOT_TOKEN = os.getenv("7993511855:AAFRUpzz88JsYflrqFIbv8OlmFiNnMJ_kaQ")
 TELEGRAM_USER_ID = os.getenv("7061959697")  # should be numeric string
 
-THRESHOLD = 10  # % movement threshold
-INTERVAL = '1h'  # Binance interval (use stable ones: 1h, 2h, 4h, etc.)
+THRESHOLD = 1  # % movement threshold
+INTERVAL = '2h'  # Binance interval (use stable ones: 1h, 2h, 4h, etc.)
 SLEEP_INTERVAL = 600  # 10 minutes in seconds
 
 # === Telegram Sender (auto-split messages) ===
