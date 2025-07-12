@@ -8,10 +8,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")  # should be numeric string
 
 THRESHOLD = 0.5  # % movement threshold
-INTERVAL = '15m'  # Binance interval (use stable ones: 1h, 2h, 4h, etc.)
+INTERVAL = '1h'  # Binance interval (e.g., '1h', '3h')
 SLEEP_INTERVAL = 600  # 10 minutes in seconds
 
-# === Telegram Sender (auto-split messages) ===
+# === Telegram Sender ===
 async def send_telegram(session, message):
     MAX_LEN = 4000
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -21,6 +21,7 @@ async def send_telegram(session, message):
         payload = {
             "chat_id": TELEGRAM_USER_ID,
             "text": chunk
+            # remove "parse_mode"
         }
         async with session.post(url, data=payload) as res:
             if res.status != 200:
@@ -49,7 +50,7 @@ async def fetch_change(session, symbol, is_futures):
                 new_price = float(data[1][4])
                 if old_price > 0:
                     change = ((new_price - old_price) / old_price) * 100
-                    msg = f"{symbol} {'UP' if change >= 0 else 'DOWN'} {abs(change):.2f}% | {INTERVAL}: from {old_price:,.6f} → {new_price:,.6f}"
+                    msg = f"`{symbol}` {'UP' if change >= 0 else 'DOWN'} {abs(change):.2f}% | {INTERVAL}: from {old_price:,.6f} → {new_price:,.6f}"
                     if change >= THRESHOLD:
                         return ("gainer", change, f"🚀 {msg}")
                     elif change <= -THRESHOLD:
@@ -58,7 +59,7 @@ async def fetch_change(session, symbol, is_futures):
         print(f"⚠️ {symbol} error: {e}")
     return None
 
-# === Scan Market (sort results) ===
+# === Group and Sort Movers ===
 async def scan_market(session, symbols, is_futures):
     tasks = [fetch_change(session, sym, is_futures) for sym in symbols]
     results = await asyncio.gather(*tasks)
@@ -76,7 +77,7 @@ async def scan_market(session, symbols, is_futures):
 
     return [g[2] for g in gainers], [l[2] for l in losers]
 
-# === Scan and Send ===
+# === Full Scanner Execution ===
 async def run_scan():
     async with aiohttp.ClientSession() as session:
         print(f"\n🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC - Starting scan...")
@@ -91,27 +92,29 @@ async def run_scan():
             scan_market(session, futures_symbols, is_futures=True)
         )
 
+        # === Format Spot Message ===
         if spot_gainers or spot_losers:
-            message = f"📊 Spot Movers (±{THRESHOLD}% in {INTERVAL}):\n\n"
+            message = f"📊 *Spot Movers (±{THRESHOLD}% in {INTERVAL}):*\n\n"
             if spot_gainers:
-                message += "🚀 Gainers:\n" + "\n".join(spot_gainers) + "\n\n"
+                message += "*🚀 Gainers:*\n" + "\n".join(spot_gainers) + "\n\n"
             if spot_losers:
-                message += "📉 Losers:\n" + "\n".join(spot_losers)
+                message += "*📉 Losers:*\n" + "\n".join(spot_losers)
             await send_telegram(session, message)
         else:
             print("✅ No Spot movers found.")
 
+        # === Format Futures Message ===
         if futures_gainers or futures_losers:
-            message = f"📈 Futures Movers (±{THRESHOLD}% in {INTERVAL}):\n\n"
+            message = f"📈 *Futures Movers (±{THRESHOLD}% in {INTERVAL}):*\n\n"
             if futures_gainers:
-                message += "🚀 Gainers:\n" + "\n".join(futures_gainers) + "\n\n"
+                message += "*🚀 Gainers:*\n" + "\n".join(futures_gainers) + "\n\n"
             if futures_losers:
-                message += "📉 Losers:\n" + "\n".join(futures_losers)
+                message += "*📉 Losers:*\n" + "\n".join(futures_losers)
             await send_telegram(session, message)
         else:
             print("✅ No Futures movers found.")
 
-# === Main Loop ===
+# === Loop Forever ===
 async def main():
     while True:
         try:
@@ -121,5 +124,6 @@ async def main():
         print(f"✅ Sleeping for {SLEEP_INTERVAL // 60} minutes...\n")
         await asyncio.sleep(SLEEP_INTERVAL)
 
+# === Start the Bot ===
 if __name__ == "__main__":
     asyncio.run(main())
