@@ -6,9 +6,9 @@ from datetime import datetime
 # === ENV Variables ===
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")
-THRESHOLD = float(os.getenv("THRESHOLD", "0.5"))  # % movement threshold
-INTERVAL = os.getenv("INTERVAL", "60")  # Bybit intervals: 1, 3, 5, 15, 30, 60, 120, etc.
-SLEEP_INTERVAL = int(os.getenv("SLEEP_INTERVAL", "600"))  # 10 minutes in seconds
+THRESHOLD = os.getenv("THRESHOLD")  # % movement threshold
+INTERVAL = os.getenv("INTERVAL")  # Bybit intervals: 1, 3, 5, 15, 30, 60, 120, etc.
+SLEEP_INTERVAL = os.getenv("SLEEP_INTERVAL")  # 10 minutes in seconds
 
 # === Telegram Sender ===
 async def send_telegram(session, message):
