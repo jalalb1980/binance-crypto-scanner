@@ -21,7 +21,7 @@ async def send_telegram(session, message):
         payload = {
             "chat_id": TELEGRAM_USER_ID,
             "text": chunk
-            # remove "parse_mode"
+            # Note: No parse_mode to avoid formatting issues
         }
         async with session.post(url, data=payload) as res:
             if res.status != 200:
@@ -29,9 +29,16 @@ async def send_telegram(session, message):
 
 # === Symbol Fetching ===
 async def fetch_symbols(session, url, filter_fn):
-    async with session.get(url) as res:
-        data = await res.json()
-        return [s['symbol'] for s in data['symbols'] if filter_fn(s)][:200]
+    try:
+        async with session.get(url) as res:
+            data = await res.json()
+            if "symbols" not in data:
+                print(f"❌ 'symbols' missing in response from {url}:\n{data}")
+                return []
+            return [s['symbol'] for s in data['symbols'] if filter_fn(s)]
+    except Exception as e:
+        print(f"❌ Failed to fetch symbols from {url}:", e)
+        return []
 
 def is_spot_usdt(s): return s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING'
 def is_futures_usdt(s): return s['quoteAsset'] == 'USDT' and s.get('contractType') == 'PERPETUAL'
@@ -86,6 +93,8 @@ async def run_scan():
             fetch_symbols(session, "https://api.binance.com/api/v3/exchangeInfo", is_spot_usdt),
             fetch_symbols(session, "https://fapi.binance.com/fapi/v1/exchangeInfo", is_futures_usdt)
         )
+
+        print(f"🔍 Spot symbols: {len(spot_symbols)}, Futures symbols: {len(futures_symbols)}")
 
         (spot_gainers, spot_losers), (futures_gainers, futures_losers) = await asyncio.gather(
             scan_market(session, spot_symbols, is_futures=False),
