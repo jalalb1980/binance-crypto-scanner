@@ -26,6 +26,10 @@ async def send_telegram(session, message):
 async def fetch_symbols(session, url, filter_fn):
     async with session.get(url) as res:
         data = await res.json()
+        if "symbols" not in data:
+            print("❌ Error fetching symbols from:", url)
+            print("🔎 Response:", data)
+            return []
         return [s['symbol'] for s in data['symbols'] if filter_fn(s)]
 
 def is_spot_usdt(s): return s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING'
