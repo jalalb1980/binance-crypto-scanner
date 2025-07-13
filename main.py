@@ -5,8 +5,8 @@ from datetime import datetime
 # === CONFIGURATION ===
 TELEGRAM_BOT_TOKEN = '7993511855:AAFRUpzz88JsYflrqFIbv8OlmFiNnMJ_kaQ'
 TELEGRAM_USER_ID = '7061959697'
-THRESHOLD = 1  # % movement threshold
-INTERVAL = '15m'  # Options: 1h, 2h, 4h, 1d, etc.
+THRESHOLD = 10  # % movement threshold
+INTERVAL = '1d'  # Options: 1h, 2h, 4h, 1d, etc.
 SLEEP_INTERVAL = 600  # 10 minutes in seconds
 
 async def send_telegram(session, message):
