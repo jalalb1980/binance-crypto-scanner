@@ -1,59 +1,50 @@
 import asyncio
 import aiohttp
-import os
 from datetime import datetime
 
-# === ENV Variables ===
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")
-THRESHOLD = os.getenv("THRESHOLD")  # % movement threshold
-INTERVAL = os.getenv("INTERVAL")  # Bybit intervals: 1, 3, 5, 15, 30, 60, 120, etc.
-SLEEP_INTERVAL = os.getenv("SLEEP_INTERVAL")  # 10 minutes in seconds
+# === CONFIGURATION ===
+TELEGRAM_BOT_TOKEN = '7993511855:AAFRUpzz88JsYflrqFIbv8OlmFiNnMJ_kaQ'
+TELEGRAM_USER_ID = '7061959697'
+THRESHOLD = 10  # % movement threshold
+INTERVAL = '1d'  # Options: 1h, 2h, 4h, 1d, etc.
+SLEEP_INTERVAL = 600  # 10 minutes in seconds
 
-BYBIT_PROXY_BASE = "https://workers-playground-square-base-9b3a.jalal-binche.workers.dev/v5/market"
-
-# === Telegram Sender ===
 async def send_telegram(session, message):
+    MAX_LEN = 4000
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_USER_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    async with session.post(url, data=payload) as res:
-        if res.status != 200:
-            print("❌ Telegram error:", await res.text())
+    chunks = [message[i:i+MAX_LEN] for i in range(0, len(message), MAX_LEN)]
 
-# === Fetch Bybit Symbols ===
-async def fetch_symbols(session, category):
-    url = f"{BYBIT_PROXY_BASE}/instruments-info?category={category}"
-    try:
-        async with session.get(url) as res:
-            data = await res.json()
-            return [s['symbol'] for s in data.get('result', {}).get('list', [])]
-    except Exception as e:
-        print(f"❌ Symbol fetch error: {e}")
-        return []
+    for chunk in chunks:
+        payload = {
+            "chat_id": TELEGRAM_USER_ID,
+            "text": chunk
+        }
+        async with session.post(url, data=payload) as res:
+            if res.status != 200:
+                print("❌ Telegram error:", await res.text())
 
-# === Fetch Price Change ===
-async def fetch_change(session, symbol, category):
-    url = f"{BYBIT_PROXY_BASE}/kline"
-    params = {
-        "category": category,
-        "symbol": symbol,
-        "interval": INTERVAL,
-        "limit": 2
-    }
+async def fetch_symbols(session, url, filter_fn):
+    async with session.get(url) as res:
+        data = await res.json()
+        return [s['symbol'] for s in data['symbols'] if filter_fn(s)]
+
+def is_spot_usdt(s): return s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING'
+def is_futures_usdt(s): return s['quoteAsset'] == 'USDT' and s.get('contractType') == 'PERPETUAL'
+
+async def fetch_change(session, symbol, is_futures):
+    base = "https://fapi.binance.com" if is_futures else "https://api.binance.com"
+    path = "/fapi/v1/klines" if is_futures else "/api/v3/klines"
+    url = f"{base}{path}"
+    params = {'symbol': symbol, 'interval': INTERVAL, 'limit': 2}
     try:
         async with session.get(url, params=params) as res:
             data = await res.json()
-            klines = data.get("result", {}).get("list", [])
-            if len(klines) >= 2:
-                old_price = float(klines[0][4])
-                new_price = float(klines[1][4])
+            if isinstance(data, list) and len(data) == 2:
+                old_price = float(data[0][4])
+                new_price = float(data[1][4])
                 if old_price > 0:
                     change = ((new_price - old_price) / old_price) * 100
-                    msg = f"`{symbol}` {'UP' if change >= 0 else 'DOWN'} {abs(change):.2f}% | {INTERVAL}m: {old_price:.4f} → {new_price:.4f}"
+                    msg = f"`{symbol}` {'UP' if change >= 0 else 'DOWN'} {abs(change):.2f}% | {INTERVAL}: from {old_price:,.6f} → {new_price:,.6f}"
                     if change >= THRESHOLD:
                         return ("gainer", change, f"🚀 {msg}")
                     elif change <= -THRESHOLD:
@@ -62,9 +53,8 @@ async def fetch_change(session, symbol, category):
         print(f"⚠️ {symbol} error: {e}")
     return None
 
-# === Market Scanner ===
-async def scan_market(session, symbols, category):
-    tasks = [fetch_change(session, sym, category) for sym in symbols]
+async def scan_market(session, symbols, is_futures):
+    tasks = [fetch_change(session, sym, is_futures) for sym in symbols]
     results = await asyncio.gather(*tasks)
 
     gainers = sorted([r for r in results if r and r[0] == "gainer"], key=lambda x: x[1], reverse=True)
@@ -72,22 +62,22 @@ async def scan_market(session, symbols, category):
 
     return [g[2] for g in gainers], [l[2] for l in losers]
 
-# === Full Scanner Execution ===
 async def run_scan():
     async with aiohttp.ClientSession() as session:
         print(f"\n🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC - Starting scan...")
 
-        spot_symbols = await fetch_symbols(session, "spot")
-        futures_symbols = await fetch_symbols(session, "linear")
-        print(f"✅ Spot: {len(spot_symbols)} symbols, Futures: {len(futures_symbols)} symbols")
+        spot_symbols, futures_symbols = await asyncio.gather(
+            fetch_symbols(session, "https://api.binance.com/api/v3/exchangeInfo", is_spot_usdt),
+            fetch_symbols(session, "https://fapi.binance.com/fapi/v1/exchangeInfo", is_futures_usdt)
+        )
 
         (spot_gainers, spot_losers), (futures_gainers, futures_losers) = await asyncio.gather(
-            scan_market(session, spot_symbols, "spot"),
-            scan_market(session, futures_symbols, "linear")
+            scan_market(session, spot_symbols, is_futures=False),
+            scan_market(session, futures_symbols, is_futures=True)
         )
 
         if spot_gainers or spot_losers:
-            message = f"📊 *Spot Movers (±{THRESHOLD}% in {INTERVAL}m):*\n\n"
+            message = f"📊 *Spot Movers (±{THRESHOLD}% in {INTERVAL}):*\n\n"
             if spot_gainers:
                 message += "*🚀 Gainers:*\n" + "\n".join(spot_gainers) + "\n\n"
             if spot_losers:
@@ -97,7 +87,7 @@ async def run_scan():
             print("✅ No Spot movers found.")
 
         if futures_gainers or futures_losers:
-            message = f"📈 *Futures Movers (±{THRESHOLD}% in {INTERVAL}m):*\n\n"
+            message = f"📈 *Futures Movers (±{THRESHOLD}% in {INTERVAL}):*\n\n"
             if futures_gainers:
                 message += "*🚀 Gainers:*\n" + "\n".join(futures_gainers) + "\n\n"
             if futures_losers:
@@ -106,16 +96,5 @@ async def run_scan():
         else:
             print("✅ No Futures movers found.")
 
-# === Infinite Loop ===
-async def main():
-    while True:
-        try:
-            await run_scan()
-        except Exception as e:
-            print("🚨 Error during scan:", e)
-        print(f"⏳ Sleeping {SLEEP_INTERVAL // 60} minutes...\n")
-        await asyncio.sleep(SLEEP_INTERVAL)
-
-# === Start ===
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run_scan())
