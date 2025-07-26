@@ -1,104 +1,222 @@
 import asyncio
 import aiohttp
+import numpy as np
 from datetime import datetime
 
 # === CONFIGURATION ===
 TELEGRAM_BOT_TOKEN = '7993511855:AAFRUpzz88JsYflrqFIbv8OlmFiNnMJ_kaQ'
 TELEGRAM_USER_ID = '7061959697'
-THRESHOLD = 10  # % movement threshold
-INTERVAL = '1d'  # Options: 1h, 2h, 4h, 1d, etc.
-SLEEP_INTERVAL = 600  # 10 minutes in seconds
+SLEEP_INTERVAL = 1800
+MAX_CONCURRENT_REQUESTS = 10
+MIN_SCORE_EARLY = 3
+MIN_SCORE_CONFIRMED = 4
+PRICE_CHANGE_THRESHOLD = 10.0
+VOLUME_SPIKE_RATIO = 2.0
+CANDLE_LIMIT = 50
 
-async def send_telegram(session, message):
-    MAX_LEN = 4000
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    chunks = [message[i:i+MAX_LEN] for i in range(0, len(message), MAX_LEN)]
+TIMEFRAMES = ["30m", "4h", "1d"]
+LOW_TF, MID_TF, HIGH_TF = TIMEFRAMES
+MOMENTUM_TF = LOW_TF
+INDICATOR_TFS = [MID_TF, HIGH_TF]
+PRICE_TF = HIGH_TF
+TRIANGLE_TF = MID_TF
 
-    for chunk in chunks:
-        payload = {
-            "chat_id": TELEGRAM_USER_ID,
-            "text": chunk
-        }
-        async with session.post(url, data=payload) as res:
-            if res.status != 200:
-                print("❌ Telegram error:", await res.text())
+def is_futures_usdt(symbol):
+    return symbol.get('quoteAsset') == 'USDT' and symbol.get('contractType') == 'PERPETUAL'
 
-async def fetch_symbols(session, url, filter_fn):
+async def fetch_symbols(session):
+    url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
     async with session.get(url) as res:
         data = await res.json()
-        if "symbols" not in data:
-            print("❌ Error fetching symbols from:", url)
-            print("🔎 Response:", data)
-            return []
-        return [s['symbol'] for s in data['symbols'] if filter_fn(s)]
+        return [s['symbol'] for s in data['symbols'] if is_futures_usdt(s)]
 
-def is_spot_usdt(s): return s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING'
-def is_futures_usdt(s): return s['quoteAsset'] == 'USDT' and s.get('contractType') == 'PERPETUAL'
+async def fetch_candles(session, symbol, interval):
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={CANDLE_LIMIT}"
+    async with session.get(url) as res:
+        return await res.json()
 
-async def fetch_change(session, symbol, is_futures):
-    base = "https://fapi.binance.com" if is_futures else "https://api.binance.com"
-    path = "/fapi/v1/klines" if is_futures else "/api/v3/klines"
-    url = f"{base}{path}"
-    params = {'symbol': symbol, 'interval': INTERVAL, 'limit': 2}
-    try:
-        async with session.get(url, params=params) as res:
-            data = await res.json()
-            if isinstance(data, list) and len(data) == 2:
-                old_price = float(data[0][4])
-                new_price = float(data[1][4])
-                if old_price > 0:
-                    change = ((new_price - old_price) / old_price) * 100
-                    msg = f"`{symbol}` {'UP' if change >= 0 else 'DOWN'} {abs(change):.2f}% | {INTERVAL}: from {old_price:,.6f} → {new_price:,.6f}"
-                    if change >= THRESHOLD:
-                        return ("gainer", change, f"🚀 {msg}")
-                    elif change <= -THRESHOLD:
-                        return ("loser", abs(change), f"📉 {msg}")
-    except Exception as e:
-        print(f"⚠️ {symbol} error: {e}")
-    return None
+async def send_telegram(session, text):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    await session.post(url, data={"chat_id": TELEGRAM_USER_ID, "text": text, "parse_mode": "Markdown"})
 
-async def scan_market(session, symbols, is_futures):
-    tasks = [fetch_change(session, sym, is_futures) for sym in symbols]
+# === INDICATORS ===
+def calc_ema(closes, span):
+    return np.convolve(closes, np.ones(span)/span, mode='valid')[-1]
+
+def rsi(closes, period=14):
+    delta = np.diff(closes)
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+    avg_gain = np.mean(gain[-period:])
+    avg_loss = np.mean(loss[-period:])
+    rs = avg_gain / avg_loss if avg_loss != 0 else 0
+    return 100 - (100 / (1 + rs))
+
+def macd(closes):
+    ema12 = np.convolve(closes, np.ones(12)/12, mode='valid')
+    ema26 = np.convolve(closes, np.ones(26)/26, mode='valid')
+    macd_line = ema12[-len(ema26):] - ema26
+    signal_line = np.convolve(macd_line, np.ones(9)/9, mode='valid')
+    hist = macd_line[-len(signal_line):] - signal_line
+    return hist
+
+def psar(closes, af_step=0.02, af_max=0.2):
+    psar = [closes[0]]
+    ep = closes[0]
+    af = af_step
+    up = True
+    for i in range(1, len(closes)):
+        prev = psar[-1]
+        if up:
+            psar.append(prev + af * (ep - prev))
+            if closes[i] > ep:
+                ep = closes[i]
+                af = min(af + af_step, af_max)
+            elif closes[i] < psar[-1]:
+                up = False
+                psar[-1] = ep
+                ep = closes[i]
+                af = af_step
+        else:
+            psar.append(prev + af * (ep - prev))
+            if closes[i] < ep:
+                ep = closes[i]
+                af = min(af + af_step, af_max)
+            elif closes[i] > psar[-1]:
+                up = True
+                psar[-1] = ep
+                ep = closes[i]
+                af = af_step
+    return psar
+
+def bollinger_band(closes, period=20):
+    ma = np.mean(closes[-period:])
+    std = np.std(closes[-period:])
+    return closes[-1] > ma + std or closes[-1] < ma - std
+
+def stochrsi(closes, period=14):
+    rsi_vals = np.array([rsi(closes[i:i+period]) for i in range(len(closes)-period)])
+    low = np.min(rsi_vals)
+    high = np.max(rsi_vals)
+    last = rsi_vals[-1] if len(rsi_vals) > 0 else 50
+    return last > 80 or last < 20
+
+def detect_momentum(closes):
+    return closes[-1] > closes[-2] > closes[-3] or closes[-1] < closes[-2] < closes[-3]
+
+def detect_triangle(candles):
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
+    closes = [float(c[4]) for c in candles]
+    upper = max(highs[-10:])
+    lower = min(lows[-10:])
+    width = upper - lower
+    if width < 0.02 * closes[-1]:
+        return '▲' if closes[-1] > closes[-2] else '▼'
+    return '(Tx)'
+
+async def analyze_symbol(session, symbol, semaphore):
+    async with semaphore:
+        try:
+            tfs = set(INDICATOR_TFS + [MOMENTUM_TF, PRICE_TF, TRIANGLE_TF])
+            candles = {tf: await fetch_candles(session, symbol, tf) for tf in tfs}
+            closes = {tf: [float(c[4]) for c in candles[tf]] for tf in tfs}
+            volumes = [float(c[5]) for c in candles[MID_TF]]
+
+            combined = []
+            for tf in INDICATOR_TFS:
+                ind = closes[tf]
+                indicators = {
+                    'EMA': calc_ema(ind[-21:], 9) > calc_ema(ind[-21:], 21),
+                    'RSI': rsi(ind) > 50,
+                    'MACD': macd(ind)[-1] > 0,
+                    'SAR': ind[-1] > psar(ind)[-1],
+                    'BOLL': bollinger_band(ind),
+                    'STOCH': stochrsi(ind)
+                }
+                combined.append(indicators)
+
+            summary = {}
+            for key in combined[0].keys():
+                summary[key] = sum(1 for i in combined if i[key])
+
+            score = sum(v > 0 for v in summary.values())
+            momentum = detect_momentum(closes[MOMENTUM_TF])
+            price_change = ((closes[PRICE_TF][-1] - closes[PRICE_TF][-2]) / closes[PRICE_TF][-2]) * 100
+            triangle = detect_triangle(candles[TRIANGLE_TF])
+            avg_vol = np.mean(volumes[:-1])
+            vol_spike = volumes[-1] > avg_vol * VOLUME_SPIKE_RATIO
+
+            label = "(Early)" if score == MIN_SCORE_EARLY and momentum else \
+                    "(Confirmed)" if score >= MIN_SCORE_CONFIRMED and abs(price_change) >= PRICE_CHANGE_THRESHOLD else None
+            if not label:
+                return None
+
+            trend = "bullish" if price_change > 0 else "bearish"
+            indicators_fmt = " - ".join([f"{k}:{'S' if summary[k] else 'W'}" for k in summary])
+            msg = f"**{symbol}** {triangle}{' (M)' if momentum else ''}{' Vol↑' if vol_spike else ''} | {price_change:+.2f}% | Score:{score} | {label} | {indicators_fmt}"
+            return trend, label, score, abs(price_change), msg
+        except Exception as e:
+            print(f"❌ Error analyzing {symbol}: {e}")
+            return None
+
+def format_ranked_list(entries):
+    return "\n\n".join([f"{i+1}. {entry[4]}" for i, entry in enumerate(entries)])
+
+def format_report(bull_early, bull_conf, bear_early, bear_conf):
+    msg = "*📊 Binance Futures Trend Scanner*\n\n"
+    if bull_conf or bull_early:
+        msg += "🚀 *Bullish Signals:*\n"
+        if bull_conf:
+            msg += "🟢 *Confirmed:*\n" + format_ranked_list(bull_conf) + "\n\n"
+        if bull_early:
+            msg += "🟡 *Early:*\n" + format_ranked_list(bull_early) + "\n\n"
+    if bear_conf or bear_early:
+        msg += "🔻 *Bearish Signals:*\n"
+        if bear_conf:
+            msg += "🔴 *Confirmed:*\n" + format_ranked_list(bear_conf) + "\n\n"
+        if bear_early:
+            msg += "🟠 *Early:*\n" + format_ranked_list(bear_early)
+    return msg
+
+async def scan_market(session, symbols):
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+    tasks = [analyze_symbol(session, s, semaphore) for s in symbols]
     results = await asyncio.gather(*tasks)
+    filtered = [r for r in results if r]
 
-    gainers = sorted([r for r in results if r and r[0] == "gainer"], key=lambda x: x[1], reverse=True)
-    losers = sorted([r for r in results if r and r[0] == "loser"], key=lambda x: x[1], reverse=True)
+    def filter_and_sort(trend, label):
+        return sorted(
+            [r for r in filtered if r[0] == trend and r[1] == label],
+            key=lambda x: (-x[2], -x[3])
+        )[:10]
 
-    return [g[2] for g in gainers], [l[2] for l in losers]
+    bull_conf = filter_and_sort("bullish", "(Confirmed)")
+    bull_early = filter_and_sort("bullish", "(Early)")
+    bear_conf = filter_and_sort("bearish", "(Confirmed)")
+    bear_early = filter_and_sort("bearish", "(Early)")
+
+    return bull_early, bull_conf, bear_early, bear_conf
 
 async def run_scan():
     async with aiohttp.ClientSession() as session:
-        print(f"\n🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC - Starting scan...")
+        print(f"\n⏱️ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC - Scanning...")
+        symbols = await fetch_symbols(session)
+        bull_early, bull_conf, bear_early, bear_conf = await scan_market(session, symbols)
+        if bull_early or bull_conf or bear_early or bear_conf:
+            msg = format_report(bull_early, bull_conf, bear_early, bear_conf)
+            await send_telegram(session, msg)
+        print("✅ Scan finished.\n")
 
-        spot_symbols, futures_symbols = await asyncio.gather(
-            fetch_symbols(session, "https://api.binance.com/api/v3/exchangeInfo", is_spot_usdt),
-            fetch_symbols(session, "https://fapi.binance.com/fapi/v1/exchangeInfo", is_futures_usdt)
-        )
-
-        (spot_gainers, spot_losers), (futures_gainers, futures_losers) = await asyncio.gather(
-            scan_market(session, spot_symbols, is_futures=False),
-            scan_market(session, futures_symbols, is_futures=True)
-        )
-
-        if spot_gainers or spot_losers:
-            message = f"📊 *Spot Movers (±{THRESHOLD}% in {INTERVAL}):*\n\n"
-            if spot_gainers:
-                message += "*🚀 Gainers:*\n" + "\n".join(spot_gainers) + "\n\n"
-            if spot_losers:
-                message += "*📉 Losers:*\n" + "\n".join(spot_losers)
-            await send_telegram(session, message)
-        else:
-            print("✅ No Spot movers found.")
-
-        if futures_gainers or futures_losers:
-            message = f"📈 *Futures Movers (±{THRESHOLD}% in {INTERVAL}):*\n\n"
-            if futures_gainers:
-                message += "*🚀 Gainers:*\n" + "\n".join(futures_gainers) + "\n\n"
-            if futures_losers:
-                message += "*📉 Losers:*\n" + "\n".join(futures_losers)
-            await send_telegram(session, message)
-        else:
-            print("✅ No Futures movers found.")
+async def main():
+    while True:
+        try:
+            await run_scan()
+        except Exception as e:
+            print("🚨 Error:", e)
+        await asyncio.sleep(SLEEP_INTERVAL)
 
 if __name__ == "__main__":
-    asyncio.run(run_scan())
+    import nest_asyncio
+    nest_asyncio.apply()
+    asyncio.run(main())
