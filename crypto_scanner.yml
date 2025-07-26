@@ -23,4 +23,4 @@ jobs:
         pip install aiohttp numpy nest_asyncio
 
     - name: Run scanner
-      run: python your_script_name.py
+      run: main.py
