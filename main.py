@@ -211,12 +211,10 @@ async def run_scan():
         print("✅ Scan finished.\n")
 
 async def main():
-    while True:
-        try:
-            await run_scan()
-        except Exception as e:
-            print("🚨 Error:", e)
-        await asyncio.sleep(SLEEP_INTERVAL)
+    try:
+        await run_scan()
+    except Exception as e:
+        print("🚨 Error:", e)
 
 if __name__ == "__main__":
     import nest_asyncio
