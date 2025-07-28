@@ -26,10 +26,15 @@ def is_futures_usdt(symbol):
 
 async def fetch_symbols(session):
     url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with session.get(url) as res:
-        data = await res.json()
-        return [s['symbol'] for s in data['symbols'] if is_futures_usdt(s)]
+    try:
+        async with session.get(url) as res:
+            data = await res.json()
+            if "symbols" not in data:
+                raise ValueError(f"Invalid response: {data}")
+            return [s['symbol'] for s in data['symbols'] if is_futures_usdt(s)]
+    except Exception as e:
+        print(f"🚨 Failed to fetch symbols: {e}")
+        return []
 
 async def fetch_candles(session, symbol, interval):
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={CANDLE_LIMIT}"
