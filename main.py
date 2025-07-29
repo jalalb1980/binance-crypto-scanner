@@ -4,8 +4,8 @@ import numpy as np
 from datetime import datetime
 
 # === CONFIGURATION ===
-TELEGRAM_BOT_TOKEN = '7993511855:AAFRUpzz88JsYflrqFIbv8OlmFiNnMJ_kaQ'
-TELEGRAM_USER_ID = '7061959697'
+TELEGRAM_BOT_TOKEN = 'YOUR_BOT_TOKEN'
+TELEGRAM_USER_ID = 'YOUR_USER_ID'
 SLEEP_INTERVAL = 1800
 MAX_CONCURRENT_REQUESTS = 50
 MIN_SCORE_EARLY = 3
@@ -26,19 +26,12 @@ def is_futures_usdt(symbol):
 
 async def fetch_symbols(session):
     url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-    try:
-        async with session.get(url) as res:
-            data = await res.json()
-            if "symbols" not in data:
-                raise ValueError(f"Invalid response: {data}")
-            return [s['symbol'] for s in data['symbols'] if is_futures_usdt(s)]
-    except Exception as e:
-        print(f"🚨 Failed to fetch symbols: {e}")
-        return []
+    async with session.get(url) as res:
+        data = await res.json()
+        return [s['symbol'] for s in data['symbols'] if is_futures_usdt(s)]
 
 async def fetch_candles(session, symbol, interval):
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={CANDLE_LIMIT}"
-    timeout = aiohttp.ClientTimeout(total=10)
     async with session.get(url) as res:
         return await res.json()
 
@@ -48,92 +41,61 @@ async def send_telegram(session, text):
 
 # === INDICATORS ===
 def calc_ema(closes, span):
-    return np.convolve(closes, np.ones(span)/span, mode='valid')[-1]
+    weights = np.exp(np.linspace(-1., 0., span))
+    weights /= weights.sum()
+    a = np.convolve(closes, weights, mode='full')[:len(closes)]
+    return a[-1]
 
 def rsi(closes, period=14):
     delta = np.diff(closes)
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
+    gain = np.maximum(delta, 0)
+    loss = -np.minimum(delta, 0)
     avg_gain = np.mean(gain[-period:])
     avg_loss = np.mean(loss[-period:])
-    rs = avg_gain / avg_loss if avg_loss != 0 else 0
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 def macd(closes):
-    ema12 = np.convolve(closes, np.ones(12)/12, mode='valid')
-    ema26 = np.convolve(closes, np.ones(26)/26, mode='valid')
-    macd_line = ema12[-len(ema26):] - ema26
-    signal_line = np.convolve(macd_line, np.ones(9)/9, mode='valid')
-    hist = macd_line[-len(signal_line):] - signal_line
-    return hist
+    ema12 = calc_ema(closes[-26:], 12)
+    ema26 = calc_ema(closes[-26:], 26)
+    return ema12 - ema26
 
-def psar(closes, af_step=0.02, af_max=0.2):
-    psar = [closes[0]]
-    ep = closes[0]
-    af = af_step
-    up = True
-    for i in range(1, len(closes)):
-        prev = psar[-1]
-        if up:
-            psar.append(prev + af * (ep - prev))
-            if closes[i] > ep:
-                ep = closes[i]
-                af = min(af + af_step, af_max)
-            elif closes[i] < psar[-1]:
-                up = False
-                psar[-1] = ep
-                ep = closes[i]
-                af = af_step
-        else:
-            psar.append(prev + af * (ep - prev))
-            if closes[i] < ep:
-                ep = closes[i]
-                af = min(af + af_step, af_max)
-            elif closes[i] > psar[-1]:
-                up = True
-                psar[-1] = ep
-                ep = closes[i]
-                af = af_step
-    return psar
+def psar(closes):
+    return closes[-1] > closes[-2]  # simplified for trend check
 
-def enhanced_boll(closes, period=20):
+def bollinger_band(closes, period=20):
     ma = np.mean(closes[-period:])
     std = np.std(closes[-period:])
-    upper = ma + 2 * std
-    lower = ma - 2 * std
-    if closes[-1] > upper:
-        return 'bull'
-    elif closes[-1] < lower:
-        return 'bear'
-    return 'neutral'
+    return closes[-1] > ma + std or closes[-1] < ma - std
 
 def stochrsi(closes, period=14):
-    rsi_vals = np.array([rsi(closes[i:i+period]) for i in range(len(closes)-period)])
-    low = np.min(rsi_vals)
-    high = np.max(rsi_vals)
-    last = rsi_vals[-1] if len(rsi_vals) > 0 else 50
-    return last > 80 or last < 20
+    rsi_vals = [rsi(closes[i:i+period]) for i in range(len(closes)-period)]
+    if not rsi_vals:
+        return False
+    last_rsi = rsi_vals[-1]
+    return last_rsi > 80 or last_rsi < 20
 
-def enhanced_momentum(closes):
-    ema9 = calc_ema(closes, 9)
-    ema21 = calc_ema(closes, 21)
-    macd_hist = macd(closes)
+def detect_momentum(closes, volumes):
+    ema_fast = calc_ema(closes[-10:], 9)
+    ema_slow = calc_ema(closes[-10:], 21)
     rsi_val = rsi(closes)
-    candle_movement = closes[-1] > closes[-2] > closes[-3]
-    return ema9 > ema21 and macd_hist[-1] > 0 and rsi_val > 50 and candle_movement
+    macd_hist = macd(closes)
+    vol_spike = volumes[-1] > np.mean(volumes[:-1]) * VOLUME_SPIKE_RATIO
+    return ema_fast > ema_slow and rsi_val > 50 and macd_hist > 0 and vol_spike
 
 def detect_triangle(candles):
-    highs = [float(c[2]) for c in candles]
-    lows = [float(c[3]) for c in candles]
-    closes = [float(c[4]) for c in candles]
-    upper = max(highs[-10:])
-    lower = min(lows[-10:])
+    highs = [float(c[2]) for c in candles[-10:]]
+    lows = [float(c[3]) for c in candles[-10:]]
+    closes = [float(c[4]) for c in candles[-10:]]
+    upper = max(highs)
+    lower = min(lows)
     width = upper - lower
-    if width < 0.015 * closes[-1]:
+    if width / closes[-1] < 0.02:
         return '▲' if closes[-1] > closes[-2] else '▼'
     return '(Tx)'
 
-# === ANALYSIS ===
 async def analyze_symbol(session, symbol, semaphore):
     async with semaphore:
         try:
@@ -146,11 +108,11 @@ async def analyze_symbol(session, symbol, semaphore):
             for tf in INDICATOR_TFS:
                 ind = closes[tf]
                 indicators = {
-                    'EMA': calc_ema(ind[-21:], 9) > calc_ema(ind[-21:], 21),
+                    'EMA': calc_ema(ind, 9) > calc_ema(ind, 21),
                     'RSI': rsi(ind) > 50,
-                    'MACD': macd(ind)[-1] > 0,
-                    'SAR': ind[-1] > psar(ind)[-1],
-                    'BOLL': enhanced_boll(ind) == ('bull' if ind[-1] > ind[-2] else 'bear'),
+                    'MACD': macd(ind) > 0,
+                    'SAR': psar(ind),
+                    'BOLL': bollinger_band(ind),
                     'STOCH': stochrsi(ind)
                 }
                 combined.append(indicators)
@@ -160,14 +122,17 @@ async def analyze_symbol(session, symbol, semaphore):
                 summary[key] = sum(1 for i in combined if i[key])
 
             score = sum(v > 0 for v in summary.values())
-            momentum = enhanced_momentum(closes[MOMENTUM_TF])
+            momentum = detect_momentum(closes[MOMENTUM_TF], volumes)
             price_change = ((closes[PRICE_TF][-1] - closes[PRICE_TF][-2]) / closes[PRICE_TF][-2]) * 100
             triangle = detect_triangle(candles[TRIANGLE_TF])
-            avg_vol = np.mean(volumes[:-1])
-            vol_spike = volumes[-1] > avg_vol * VOLUME_SPIKE_RATIO
+            vol_spike = volumes[-1] > np.mean(volumes[:-1]) * VOLUME_SPIKE_RATIO
 
-            label = "(Early)" if score == MIN_SCORE_EARLY and momentum and abs(price_change) >= 3 else \
-                    "(Confirmed)" if score >= MIN_SCORE_CONFIRMED and abs(price_change) >= PRICE_CHANGE_THRESHOLD else None
+            label = None
+            if score >= MIN_SCORE_CONFIRMED and abs(price_change) >= PRICE_CHANGE_THRESHOLD:
+                label = "(Confirmed)"
+            elif score >= MIN_SCORE_EARLY and momentum and abs(price_change) > 3:
+                label = "(Early)"
+
             if not label:
                 return None
 
@@ -205,10 +170,7 @@ async def scan_market(session, symbols):
     filtered = [r for r in results if r]
 
     def filter_and_sort(trend, label):
-        return sorted(
-            [r for r in filtered if r[0] == trend and r[1] == label],
-            key=lambda x: (-x[2], -x[3])
-        )[:10]
+        return sorted([r for r in filtered if r[0] == trend and r[1] == label], key=lambda x: (-x[2], -x[3]))[:10]
 
     bull_conf = filter_and_sort("bullish", "(Confirmed)")
     bull_early = filter_and_sort("bullish", "(Early)")
