@@ -4,14 +4,13 @@ import numpy as np
 from datetime import datetime
 
 # === CONFIGURATION ===
-TELEGRAM_BOT_TOKEN = '7993511855:AAFRUpzz88JsYflrqFIbv8OlmFiNnMJ_kaQ'
-TELEGRAM_USER_ID = '7061959697'
+TELEGRAM_BOT_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'
+TELEGRAM_USER_ID = 'YOUR_TELEGRAM_USER_ID'
 SLEEP_INTERVAL = 1800
 MAX_CONCURRENT_REQUESTS = 50
 MIN_SCORE_EARLY = 3
 MIN_SCORE_CONFIRMED = 4
-EARLY_MIN_PRICE_CHANGE = 3.0
-CONFIRMED_MIN_PRICE_CHANGE = 10.0
+PRICE_CHANGE_THRESHOLD = 10.0
 VOLUME_SPIKE_RATIO = 2.0
 CANDLE_LIMIT = 50
 
@@ -30,12 +29,16 @@ async def fetch_symbols(session):
     try:
         async with session.get(url) as res:
             data = await res.json()
+            if "symbols" not in data:
+                raise ValueError(f"Invalid response: {data}")
             return [s['symbol'] for s in data['symbols'] if is_futures_usdt(s)]
-    except:
+    except Exception as e:
+        print(f"🚨 Failed to fetch symbols: {e}")
         return []
 
 async def fetch_candles(session, symbol, interval):
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={CANDLE_LIMIT}"
+    timeout = aiohttp.ClientTimeout(total=10)
     async with session.get(url) as res:
         return await res.json()
 
@@ -93,10 +96,16 @@ def psar(closes, af_step=0.02, af_max=0.2):
                 af = af_step
     return psar
 
-def bollinger_band(closes, period=20):
+def enhanced_boll(closes, period=20):
     ma = np.mean(closes[-period:])
     std = np.std(closes[-period:])
-    return closes[-1] > ma + std or closes[-1] < ma - std
+    upper = ma + 2 * std
+    lower = ma - 2 * std
+    if closes[-1] > upper:
+        return 'bull'
+    elif closes[-1] < lower:
+        return 'bear'
+    return 'neutral'
 
 def stochrsi(closes, period=14):
     rsi_vals = np.array([rsi(closes[i:i+period]) for i in range(len(closes)-period)])
@@ -105,8 +114,13 @@ def stochrsi(closes, period=14):
     last = rsi_vals[-1] if len(rsi_vals) > 0 else 50
     return last > 80 or last < 20
 
-def detect_momentum(closes):
-    return closes[-1] > closes[-2] > closes[-3] or closes[-1] < closes[-2] < closes[-3]
+def enhanced_momentum(closes):
+    ema9 = calc_ema(closes, 9)
+    ema21 = calc_ema(closes, 21)
+    macd_hist = macd(closes)
+    rsi_val = rsi(closes)
+    candle_movement = closes[-1] > closes[-2] > closes[-3]
+    return ema9 > ema21 and macd_hist[-1] > 0 and rsi_val > 50 and candle_movement
 
 def detect_triangle(candles):
     highs = [float(c[2]) for c in candles]
@@ -115,10 +129,11 @@ def detect_triangle(candles):
     upper = max(highs[-10:])
     lower = min(lows[-10:])
     width = upper - lower
-    if width < 0.02 * closes[-1]:
+    if width < 0.015 * closes[-1]:
         return '▲' if closes[-1] > closes[-2] else '▼'
     return '(Tx)'
 
+# === ANALYSIS ===
 async def analyze_symbol(session, symbol, semaphore):
     async with semaphore:
         try:
@@ -135,7 +150,7 @@ async def analyze_symbol(session, symbol, semaphore):
                     'RSI': rsi(ind) > 50,
                     'MACD': macd(ind)[-1] > 0,
                     'SAR': ind[-1] > psar(ind)[-1],
-                    'BOLL': bollinger_band(ind),
+                    'BOLL': enhanced_boll(ind) == ('bull' if ind[-1] > ind[-2] else 'bear'),
                     'STOCH': stochrsi(ind)
                 }
                 combined.append(indicators)
@@ -145,17 +160,14 @@ async def analyze_symbol(session, symbol, semaphore):
                 summary[key] = sum(1 for i in combined if i[key])
 
             score = sum(v > 0 for v in summary.values())
-            momentum = detect_momentum(closes[MOMENTUM_TF])
+            momentum = enhanced_momentum(closes[MOMENTUM_TF])
             price_change = ((closes[PRICE_TF][-1] - closes[PRICE_TF][-2]) / closes[PRICE_TF][-2]) * 100
             triangle = detect_triangle(candles[TRIANGLE_TF])
             avg_vol = np.mean(volumes[:-1])
             vol_spike = volumes[-1] > avg_vol * VOLUME_SPIKE_RATIO
 
-            label = None
-            if score >= MIN_SCORE_CONFIRMED and abs(price_change) >= CONFIRMED_MIN_PRICE_CHANGE:
-                label = "(Confirmed)"
-            elif score == MIN_SCORE_EARLY and momentum and abs(price_change) >= EARLY_MIN_PRICE_CHANGE:
-                label = "(Early)"
+            label = "(Early)" if score == MIN_SCORE_EARLY and momentum and abs(price_change) >= 3 else \
+                    "(Confirmed)" if score >= MIN_SCORE_CONFIRMED and abs(price_change) >= PRICE_CHANGE_THRESHOLD else None
             if not label:
                 return None
 
@@ -163,7 +175,8 @@ async def analyze_symbol(session, symbol, semaphore):
             indicators_fmt = " - ".join([f"{k}:{'S' if summary[k] else 'W'}" for k in summary])
             msg = f"**{symbol}** {triangle}{' (M)' if momentum else ''}{' Vol↑' if vol_spike else ''} | {price_change:+.2f}% | Score:{score} | {label} | {indicators_fmt}"
             return trend, label, score, abs(price_change), msg
-        except:
+        except Exception as e:
+            print(f"❌ Error analyzing {symbol}: {e}")
             return None
 
 def format_ranked_list(entries):
