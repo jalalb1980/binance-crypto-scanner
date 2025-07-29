@@ -4,14 +4,13 @@ import numpy as np
 from datetime import datetime
 
 # === CONFIGURATION ===
-TELEGRAM_BOT_TOKEN = 'YOUR_BOT_TOKEN'
-TELEGRAM_USER_ID = 'YOUR_USER_ID'
+TELEGRAM_BOT_TOKEN = '7993511855:AAFRUpzz88JsYflrqFIbv8OlmFiNnMJ_kaQ'
+TELEGRAM_USER_ID = '7061959697'
 SLEEP_INTERVAL = 1800
-MAX_CONCURRENT_REQUESTS = 50
+MAX_CONCURRENT_REQUESTS = 10
 MIN_SCORE_EARLY = 3
 MIN_SCORE_CONFIRMED = 4
-EARLY_MIN_PRICE_CHANGE = 3.0
-CONFIRMED_MIN_PRICE_CHANGE = 10.0
+PRICE_CHANGE_THRESHOLD = 10.0
 VOLUME_SPIKE_RATIO = 2.0
 CANDLE_LIMIT = 50
 
@@ -27,12 +26,9 @@ def is_futures_usdt(symbol):
 
 async def fetch_symbols(session):
     url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-    try:
-        async with session.get(url) as res:
-            data = await res.json()
-            return [s['symbol'] for s in data['symbols'] if is_futures_usdt(s)]
-    except:
-        return []
+    async with session.get(url) as res:
+        data = await res.json()
+        return [s['symbol'] for s in data['symbols'] if is_futures_usdt(s)]
 
 async def fetch_candles(session, symbol, interval):
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={CANDLE_LIMIT}"
@@ -151,11 +147,8 @@ async def analyze_symbol(session, symbol, semaphore):
             avg_vol = np.mean(volumes[:-1])
             vol_spike = volumes[-1] > avg_vol * VOLUME_SPIKE_RATIO
 
-            label = None
-            if score >= MIN_SCORE_CONFIRMED and abs(price_change) >= CONFIRMED_MIN_PRICE_CHANGE:
-                label = "(Confirmed)"
-            elif score == MIN_SCORE_EARLY and momentum and abs(price_change) >= EARLY_MIN_PRICE_CHANGE:
-                label = "(Early)"
+            label = "(Early)" if score == MIN_SCORE_EARLY and momentum else \
+                    "(Confirmed)" if score >= MIN_SCORE_CONFIRMED and abs(price_change) >= PRICE_CHANGE_THRESHOLD else None
             if not label:
                 return None
 
@@ -163,7 +156,8 @@ async def analyze_symbol(session, symbol, semaphore):
             indicators_fmt = " - ".join([f"{k}:{'S' if summary[k] else 'W'}" for k in summary])
             msg = f"**{symbol}** {triangle}{' (M)' if momentum else ''}{' Vol↑' if vol_spike else ''} | {price_change:+.2f}% | Score:{score} | {label} | {indicators_fmt}"
             return trend, label, score, abs(price_change), msg
-        except:
+        except Exception as e:
+            print(f"❌ Error analyzing {symbol}: {e}")
             return None
 
 def format_ranked_list(entries):
@@ -215,10 +209,12 @@ async def run_scan():
         print("✅ Scan finished.\n")
 
 async def main():
-    try:
-        await run_scan()
-    except Exception as e:
-        print("🚨 Error:", e)
+    while True:
+        try:
+            await run_scan()
+        except Exception as e:
+            print("🚨 Error:", e)
+        await asyncio.sleep(SLEEP_INTERVAL)
 
 if __name__ == "__main__":
     import nest_asyncio
