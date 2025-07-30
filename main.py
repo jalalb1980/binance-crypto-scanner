@@ -18,7 +18,7 @@ TIMEFRAMES = ["30m", "4h", "1d"]
 LOW_TF, MID_TF, HIGH_TF = TIMEFRAMES
 MOMENTUM_TF = LOW_TF
 INDICATOR_TFS = [MID_TF, HIGH_TF]
-PRICE_TF = "1h"  # updated to 1h
+PRICE_TF = MID_TF
 TRIANGLE_TF = MID_TF
 
 def is_futures_usdt(symbol):
