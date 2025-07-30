@@ -3,22 +3,20 @@ import aiohttp
 import numpy as np
 from datetime import datetime
 
-# === CONFIGURATION ===
 TELEGRAM_BOT_TOKEN = '7993511855:AAFRUpzz88JsYflrqFIbv8OlmFiNnMJ_kaQ'
 TELEGRAM_USER_ID = '7061959697'
 SLEEP_INTERVAL = 1800
 MAX_CONCURRENT_REQUESTS = 50
 MIN_SCORE_EARLY = 3
 MIN_SCORE_CONFIRMED = 4
-PRICE_CHANGE_THRESHOLD = 10.0
 VOLUME_SPIKE_RATIO = 2.0
 CANDLE_LIMIT = 50
 
-TIMEFRAMES = ["30m", "1h", "4h"]
+TIMEFRAMES = ["30m", "4h", "1d"]
 LOW_TF, MID_TF, HIGH_TF = TIMEFRAMES
 MOMENTUM_TF = LOW_TF
 INDICATOR_TFS = [MID_TF, HIGH_TF]
-PRICE_TF = MID_TF
+PRICE_TF = "1h"
 TRIANGLE_TF = MID_TF
 
 def is_futures_usdt(symbol):
@@ -94,21 +92,17 @@ def bollinger_band(closes, period=20):
     std = np.std(closes[-period:])
     return closes[-1] > ma + std or closes[-1] < ma - std
 
-def stochrsi_signal(closes, period=14):
-    rsis = [rsi(closes[i:i+period]) for i in range(len(closes) - period)]
-    if len(rsis) < 3:
-        return None  # Not enough data
-
-    k = (rsis[-1] - min(rsis)) / (max(rsis) - min(rsis) + 1e-9) * 100
-    d = np.mean([(rsis[-i] - min(rsis)) / (max(rsis) - min(rsis) + 1e-9) * 100 for i in range(1, 4)])
-
-    prev_k = (rsis[-2] - min(rsis)) / (max(rsis) - min(rsis) + 1e-9) * 100
-    prev_d = np.mean([(rsis[-i] - min(rsis)) / (max(rsis) - min(rsis) + 1e-9) * 100 for i in range(2, 5)])
-
-    bullish = k < 50 and d < 50 and prev_k < prev_d and k > d
-    bearish = k > 50 and d > 50 and prev_k > prev_d and k < d
-
-    return "bullish" if bullish else "bearish" if bearish else None
+def stochrsi_cross(closes, period=14):
+    rsi_vals = np.array([rsi(closes[i:i+period]) for i in range(len(closes)-period)])
+    if len(rsi_vals) < 3:
+        return False, False
+    stoch = (rsi_vals - rsi_vals.min()) / (rsi_vals.max() - rsi_vals.min()) * 100
+    ma_stoch = np.convolve(stoch, np.ones(3)/3, mode='valid')
+    if len(ma_stoch) < 2:
+        return False, False
+    bullish = stoch[-1] > ma_stoch[-1] and stoch[-2] < ma_stoch[-2] and stoch[-1] < 50
+    bearish = stoch[-1] < ma_stoch[-1] and stoch[-2] > ma_stoch[-2] and stoch[-1] > 50
+    return bullish, bearish
 
 def detect_momentum(closes):
     return closes[-1] > closes[-2] > closes[-3] or closes[-1] < closes[-2] < closes[-3]
@@ -135,13 +129,14 @@ async def analyze_symbol(session, symbol, semaphore):
             combined = []
             for tf in INDICATOR_TFS:
                 ind = closes[tf]
+                st_bull, st_bear = stochrsi_cross(ind)
                 indicators = {
                     'EMA': calc_ema(ind[-21:], 9) > calc_ema(ind[-21:], 21),
                     'RSI': rsi(ind) > 50,
                     'MACD': macd(ind)[-1] > 0,
                     'SAR': ind[-1] > psar(ind)[-1],
                     'BOLL': bollinger_band(ind),
-                    'STOCH': stochrsi_signal(ind) == ("bullish" if ind[-1] > ind[-2] else "bearish")
+                    'STOCH': st_bull if rsi(ind) < 50 else not st_bear
                 }
                 combined.append(indicators)
 
@@ -156,8 +151,7 @@ async def analyze_symbol(session, symbol, semaphore):
             avg_vol = np.mean(volumes[:-1])
             vol_spike = volumes[-1] > avg_vol * VOLUME_SPIKE_RATIO
 
-            label = "(Early)" if score == MIN_SCORE_EARLY and momentum and abs(price_change) >= 3 else \
-                    "(Confirmed)" if score >= MIN_SCORE_CONFIRMED and abs(price_change) >= PRICE_CHANGE_THRESHOLD else None
+            label = "(Early)" if score == MIN_SCORE_EARLY and momentum else "(Confirmed)" if score >= MIN_SCORE_CONFIRMED else None
             if not label:
                 return None
 
