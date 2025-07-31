@@ -3,20 +3,21 @@ import aiohttp
 import numpy as np
 from datetime import datetime
 
-TELEGRAM_BOT_TOKEN = '7993511855:AAFRUpzz88JsYflrqFIbv8OlmFiNnMJ_kaQ'
-TELEGRAM_USER_ID = '7061959697'
-SLEEP_INTERVAL = 1800
+# === CONFIGURATION ===
+TELEGRAM_BOT_TOKEN = 'YOUR_BOT_TOKEN'
+TELEGRAM_USER_ID = 'YOUR_USER_ID'
 MAX_CONCURRENT_REQUESTS = 50
 MIN_SCORE_EARLY = 3
 MIN_SCORE_CONFIRMED = 4
-VOLUME_SPIKE_RATIO = 2.0
+PRICE_CHANGE_THRESHOLD = 2.0
+VOLUME_SPIKE_STD_DEV = 1.5
 CANDLE_LIMIT = 50
 
 TIMEFRAMES = ["30m", "4h", "1d"]
 LOW_TF, MID_TF, HIGH_TF = TIMEFRAMES
 MOMENTUM_TF = LOW_TF
 INDICATOR_TFS = [MID_TF, HIGH_TF]
-PRICE_TF = "1h"
+PRICE_TF = LOW_TF
 TRIANGLE_TF = MID_TF
 
 def is_futures_usdt(symbol):
@@ -39,82 +40,62 @@ async def send_telegram(session, text):
 
 # === INDICATORS ===
 def calc_ema(closes, span):
-    return np.convolve(closes, np.ones(span)/span, mode='valid')[-1]
+    weights = np.exp(np.linspace(-1., 0., span))
+    weights /= weights.sum()
+    a = np.convolve(closes, weights, mode='full')[:len(closes)]
+    return a[-1]
 
 def rsi(closes, period=14):
     delta = np.diff(closes)
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
+    gain = np.maximum(delta, 0)
+    loss = -np.minimum(delta, 0)
     avg_gain = np.mean(gain[-period:])
     avg_loss = np.mean(loss[-period:])
-    rs = avg_gain / avg_loss if avg_loss != 0 else 0
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
 def macd(closes):
-    ema12 = np.convolve(closes, np.ones(12)/12, mode='valid')
-    ema26 = np.convolve(closes, np.ones(26)/26, mode='valid')
-    macd_line = ema12[-len(ema26):] - ema26
-    signal_line = np.convolve(macd_line, np.ones(9)/9, mode='valid')
-    hist = macd_line[-len(signal_line):] - signal_line
-    return hist
+    ema12 = calc_ema(closes[-26:], 12)
+    ema26 = calc_ema(closes[-26:], 26)
+    return ema12 - ema26
 
-def psar(closes, af_step=0.02, af_max=0.2):
-    psar = [closes[0]]
-    ep = closes[0]
-    af = af_step
-    up = True
-    for i in range(1, len(closes)):
-        prev = psar[-1]
-        if up:
-            psar.append(prev + af * (ep - prev))
-            if closes[i] > ep:
-                ep = closes[i]
-                af = min(af + af_step, af_max)
-            elif closes[i] < psar[-1]:
-                up = False
-                psar[-1] = ep
-                ep = closes[i]
-                af = af_step
-        else:
-            psar.append(prev + af * (ep - prev))
-            if closes[i] < ep:
-                ep = closes[i]
-                af = min(af + af_step, af_max)
-            elif closes[i] > psar[-1]:
-                up = True
-                psar[-1] = ep
-                ep = closes[i]
-                af = af_step
-    return psar
+def psar(closes):
+    return closes[-1] > closes[-2]
 
 def bollinger_band(closes, period=20):
     ma = np.mean(closes[-period:])
     std = np.std(closes[-period:])
     return closes[-1] > ma + std or closes[-1] < ma - std
 
-def stochrsi_cross(closes, period=14):
-    rsi_vals = np.array([rsi(closes[i:i+period]) for i in range(len(closes)-period)])
+def stochrsi(closes, period=14):
+    rsi_vals = [rsi(closes[i:i+period]) for i in range(len(closes)-period)]
     if len(rsi_vals) < 3:
-        return False, False
-    stoch = (rsi_vals - rsi_vals.min()) / (rsi_vals.max() - rsi_vals.min()) * 100
-    ma_stoch = np.convolve(stoch, np.ones(3)/3, mode='valid')
-    if len(ma_stoch) < 2:
-        return False, False
-    bullish = stoch[-1] > ma_stoch[-1] and stoch[-2] < ma_stoch[-2] and stoch[-1] < 50
-    bearish = stoch[-1] < ma_stoch[-1] and stoch[-2] > ma_stoch[-2] and stoch[-1] > 50
-    return bullish, bearish
+        return False
+    current = rsi_vals[-1]
+    previous = rsi_vals[-2]
+    if current < 50 and previous < 50 and current > previous:
+        return "bullish"
+    elif current > 50 and previous > 50 and current < previous:
+        return "bearish"
+    return False
 
-def detect_momentum(closes):
-    return closes[-1] > closes[-2] > closes[-3] or closes[-1] < closes[-2] < closes[-3]
+def detect_momentum(closes, volumes):
+    ema_fast = calc_ema(closes[-10:], 9)
+    ema_slow = calc_ema(closes[-10:], 21)
+    rsi_val = rsi(closes)
+    macd_hist = macd(closes)
+    vol_spike = volumes[-1] > np.mean(volumes[:-1]) + np.std(volumes[:-1]) * VOLUME_SPIKE_STD_DEV
+    return ema_fast > ema_slow and rsi_val > 50 and macd_hist > 0 and vol_spike
 
 def detect_triangle(candles):
-    highs = [float(c[2]) for c in candles]
-    lows = [float(c[3]) for c in candles]
-    closes = [float(c[4]) for c in candles]
-    upper = max(highs[-10:])
-    lower = min(lows[-10:])
-    width = upper - lower
-    if width < 0.02 * closes[-1]:
+    highs = [float(c[2]) for c in candles[-10:]]
+    lows = [float(c[3]) for c in candles[-10:]]
+    closes = [float(c[4]) for c in candles[-10:]]
+    upper_slope = np.polyfit(range(len(highs)), highs, 1)[0]
+    lower_slope = np.polyfit(range(len(lows)), lows, 1)[0]
+    if abs(upper_slope) < 0.1 and abs(lower_slope) < 0.1:
         return '▲' if closes[-1] > closes[-2] else '▼'
     return '(Tx)'
 
@@ -129,30 +110,30 @@ async def analyze_symbol(session, symbol, semaphore):
             combined = []
             for tf in INDICATOR_TFS:
                 ind = closes[tf]
-                st_bull, st_bear = stochrsi_cross(ind)
+                stoch_result = stochrsi(ind)
                 indicators = {
-                    'EMA': calc_ema(ind[-21:], 9) > calc_ema(ind[-21:], 21),
+                    'EMA': calc_ema(ind, 9) > calc_ema(ind, 21),
                     'RSI': rsi(ind) > 50,
-                    'MACD': macd(ind)[-1] > 0,
-                    'SAR': ind[-1] > psar(ind)[-1],
+                    'MACD': macd(ind) > 0,
+                    'SAR': psar(ind),
                     'BOLL': bollinger_band(ind),
-                    'STOCH': st_bull if rsi(ind) < 50 else not st_bear
+                    'STOCH': stoch_result == "bullish" if ind[-1] > ind[-2] else stoch_result == "bearish"
                 }
                 combined.append(indicators)
 
-            summary = {}
-            for key in combined[0].keys():
-                summary[key] = sum(1 for i in combined if i[key])
-
+            summary = {k: sum(1 for i in combined if i[k]) for k in combined[0]}
             score = sum(v > 0 for v in summary.values())
-            momentum = detect_momentum(closes[MOMENTUM_TF])
+            momentum = detect_momentum(closes[MOMENTUM_TF], volumes)
             price_change = ((closes[PRICE_TF][-1] - closes[PRICE_TF][-2]) / closes[PRICE_TF][-2]) * 100
             triangle = detect_triangle(candles[TRIANGLE_TF])
-            avg_vol = np.mean(volumes[:-1])
-            vol_spike = volumes[-1] > avg_vol * VOLUME_SPIKE_RATIO
+            vol_spike = volumes[-1] > np.mean(volumes[:-1]) + np.std(volumes[:-1]) * VOLUME_SPIKE_STD_DEV
 
-            label = "(Early)" if score == MIN_SCORE_EARLY and momentum else "(Confirmed)" if score >= MIN_SCORE_CONFIRMED else None
-            if not label:
+            label = None
+            if score >= MIN_SCORE_CONFIRMED:
+                label = "(Confirmed)"
+            elif score >= MIN_SCORE_EARLY and momentum:
+                label = "(Early)"
+            else:
                 return None
 
             trend = "bullish" if price_change > 0 else "bearish"
@@ -211,13 +192,7 @@ async def run_scan():
             await send_telegram(session, msg)
         print("✅ Scan finished.\n")
 
-async def main():
-    try:
-        await run_scan()
-    except Exception as e:
-        print("🚨 Error:", e)
-
 if __name__ == "__main__":
     import nest_asyncio
     nest_asyncio.apply()
-    asyncio.run(main())
+    asyncio.run(run_scan())
