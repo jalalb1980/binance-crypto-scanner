@@ -7,16 +7,16 @@ from datetime import datetime
 TELEGRAM_BOT_TOKEN = '7993511855:AAFRUpzz88JsYflrqFIbv8OlmFiNnMJ_kaQ'
 TELEGRAM_USER_ID = '7061959697'
 MAX_CONCURRENT_REQUESTS = 50
-CANDLE_LIMIT = 50
-VOLUME_SPIKE_RATIO = 2.0
-PRICE_CHANGE_THRESHOLD = 2.0
-MIN_SCORE = 4  # min indicator score
-TIMEFRAMES = ["30m", "1h", "4h"]
+CANDLE_LIMIT = 100
+TIMEFRAMES = ["30m", "4h", "1d"]
 LOW_TF, MID_TF, HIGH_TF = TIMEFRAMES
-MOMENTUM_TF = "30m"
-INDICATOR_TFS = ["1h", "4h"]
-PRICE_TF = "1h"
-TRIANGLE_TF = "1h"
+MOMENTUM_TF = LOW_TF
+INDICATOR_TFS = [MID_TF, HIGH_TF]
+TRIANGLE_TF = MID_TF
+PRICE_TF = MID_TF
+VOLUME_SPIKE_RATIO = 2.0
+MIN_SCORE = 4
+MIN_PRICE_CHANGE = 2.0
 
 def is_futures_usdt(symbol):
     return symbol.get('quoteAsset') == 'USDT' and symbol.get('contractType') == 'PERPETUAL'
@@ -38,10 +38,10 @@ async def send_telegram(session, text):
 
 # === INDICATORS ===
 def calc_ema(closes, span):
+    closes = np.array(closes)
     weights = np.exp(np.linspace(-1., 0., span))
     weights /= weights.sum()
-    a = np.convolve(closes, weights, mode='full')[:len(closes)]
-    return a[-1]
+    return np.convolve(closes, weights, mode='full')[:len(closes)][-1]
 
 def rsi(closes, period=14):
     delta = np.diff(closes)
@@ -54,15 +54,17 @@ def rsi(closes, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def macd(closes):
+def macd_histogram(closes):
     ema12 = calc_ema(closes[-26:], 12)
     ema26 = calc_ema(closes[-26:], 26)
-    return ema12 - ema26
+    macd = ema12 - ema26
+    signal = calc_ema(closes[-9:], 9)
+    return macd - signal
 
-def psar(closes):
+def psar_logic(closes):
     return closes[-1] > closes[-2]
 
-def bollinger_band(closes, period=20):
+def bollinger_break(closes, period=20):
     ma = np.mean(closes[-period:])
     std = np.std(closes[-period:])
     return closes[-1] > ma + std or closes[-1] < ma - std
@@ -70,47 +72,32 @@ def bollinger_band(closes, period=20):
 def stochrsi_cross(closes, period=14):
     rsi_vals = [rsi(closes[i:i+period]) for i in range(len(closes)-period)]
     if len(rsi_vals) < 3:
-        return None
-    prev = rsi_vals[-3:-1]
-    last = rsi_vals[-1]
-    avg = np.mean(prev)
-    if last > avg and last < 50:
-        return 'bullish'
-    elif last < avg and last > 50:
-        return 'bearish'
-    return None
+        return False, False
+    fast = rsi_vals[-1]
+    slow = np.mean(rsi_vals[-3:])
+    bullish = fast > slow and fast < 50
+    bearish = fast < slow and fast > 50
+    return bullish, bearish
 
 def detect_volume_spike(volumes):
-    avg = np.mean(volumes[:-1])
-    return volumes[-1] > avg * VOLUME_SPIKE_RATIO
+    return volumes[-1] > np.mean(volumes[-6:-1]) * VOLUME_SPIKE_RATIO
 
-def detect_triangle_breakout(candles):
+def detect_triangle(candles):
     highs = [float(c[2]) for c in candles[-10:]]
     lows = [float(c[3]) for c in candles[-10:]]
     closes = [float(c[4]) for c in candles[-10:]]
-    upper = max(highs)
-    lower = min(lows)
-    range_pct = (upper - lower) / closes[-1]
-    if range_pct < 0.02:
-        if closes[-1] > upper:
-            return '▲'
-        elif closes[-1] < lower:
-            return '▼'
+    width = max(highs) - min(lows)
+    if width / closes[-1] < 0.02:
+        return '▲' if closes[-1] > closes[-2] else '▼'
     return ''
 
-def detect_momentum(closes, volumes, triangle):
-    ema_fast = calc_ema(closes[-10:], 9)
-    ema_slow = calc_ema(closes[-10:], 21)
-    rsi_val = rsi(closes)
-    macd_val = macd(closes)
-    vol_spike = detect_volume_spike(volumes)
+def momentum_score(closes, volumes):
     score = 0
-    if ema_fast > ema_slow: score += 1
-    if rsi_val > 50: score += 1
-    if macd_val > 0: score += 1
-    if vol_spike: score += 1
-    if triangle: score += 1
-    return score >= 3
+    if calc_ema(closes[-10:], 9) > calc_ema(closes[-10:], 21): score += 1
+    if rsi(closes) > 50: score += 1
+    if macd_histogram(closes) > 0: score += 1
+    if detect_volume_spike(volumes): score += 1
+    return score
 
 async def analyze_symbol(session, symbol, semaphore):
     async with semaphore:
@@ -119,48 +106,55 @@ async def analyze_symbol(session, symbol, semaphore):
             candles = {tf: await fetch_candles(session, symbol, tf) for tf in tfs}
             closes = {tf: [float(c[4]) for c in candles[tf]] for tf in tfs}
             volumes = [float(c[5]) for c in candles[MID_TF]]
+            price_change = (closes[PRICE_TF][-1] - closes[PRICE_TF][-2]) / closes[PRICE_TF][-2] * 100
+            triangle = detect_triangle(candles[TRIANGLE_TF])
+            vol_spike = detect_volume_spike(volumes)
 
             combined = []
             for tf in INDICATOR_TFS:
                 ind = closes[tf]
+                st_bull, st_bear = stochrsi_cross(ind)
                 indicators = {
                     'EMA': calc_ema(ind, 9) > calc_ema(ind, 21),
                     'RSI': rsi(ind) > 50,
-                    'MACD': macd(ind) > 0,
-                    'SAR': psar(ind),
-                    'BOLL': bollinger_band(ind),
-                    'STOCH': stochrsi_cross(ind) == 'bullish'
+                    'MACD': macd_histogram(ind) > 0,
+                    'SAR': psar_logic(ind),
+                    'BOLL': bollinger_break(ind),
+                    'STOCH': st_bull if price_change > 0 else st_bear
                 }
                 combined.append(indicators)
 
-            summary = {k: sum(ind[k] for ind in combined) for k in combined[0]}
-            score = sum(v > 0 for v in summary.values())
-            triangle = detect_triangle_breakout(candles[TRIANGLE_TF])
-            momentum = detect_momentum(closes[MOMENTUM_TF], volumes, triangle)
-            price_change = ((closes[PRICE_TF][-1] - closes[PRICE_TF][-2]) / closes[PRICE_TF][-2]) * 100
-            vol_spike = detect_volume_spike(volumes)
+            summary = {k: sum(1 for i in combined if i[k]) for k in combined[0]}
+            indicator_score = sum(1 for v in summary.values() if v > 0)
+            momentum = momentum_score(closes[MOMENTUM_TF], volumes)
+            is_valid = indicator_score >= MIN_SCORE
 
-            if score < MIN_SCORE or abs(price_change) < PRICE_CHANGE_THRESHOLD:
+            if not is_valid:
                 return None
 
             trend = "bullish" if price_change > 0 else "bearish"
-            label = "(Early)" if momentum else "(Confirmed)"
+            label = "(Confirmed)" if momentum >= 3 else "(Early)"
+            mark = triangle + (" (M)" if momentum >= 3 else "")
             indicators_fmt = " - ".join([f"{k}:{'S' if summary[k] else 'W'}" for k in summary])
-            msg = f"**{symbol}** {triangle}{' (M)' if momentum else ''}{' Vol↑' if vol_spike else ''} | {price_change:+.2f}% | Score:{score} | {label} | {indicators_fmt}"
-            return trend, label, score, abs(price_change), msg
+            msg = f"**{symbol}** {mark}{' Vol↑' if vol_spike else ''} | {price_change:+.2f}% | Score:{indicator_score} | {label} | {indicators_fmt}"
+            return trend, label, indicator_score, abs(price_change), msg
         except Exception as e:
-            print(f"❌ Error analyzing {symbol}: {e}")
+            print(f"❌ {symbol} error: {e}")
             return None
 
 def format_ranked_list(entries):
     return "\n\n".join([f"{i+1}. {entry[4]}" for i, entry in enumerate(entries)])
 
-def format_report(bullish, bearish):
+def format_report(bull_early, bull_conf, bear_early, bear_conf):
     msg = "*📊 Binance Futures Trend Scanner*\n\n"
-    if bullish:
-        msg += "🚀 *Bullish Signals:*\n" + format_ranked_list(bullish) + "\n\n"
-    if bearish:
-        msg += "🔻 *Bearish Signals:*\n" + format_ranked_list(bearish)
+    if bull_conf or bull_early:
+        msg += "🚀 *Bullish Signals:*\n"
+        if bull_conf: msg += "🟢 *Confirmed:*\n" + format_ranked_list(bull_conf) + "\n\n"
+        if bull_early: msg += "🟡 *Early:*\n" + format_ranked_list(bull_early) + "\n\n"
+    if bear_conf or bear_early:
+        msg += "🔻 *Bearish Signals:*\n"
+        if bear_conf: msg += "🔴 *Confirmed:*\n" + format_ranked_list(bear_conf) + "\n\n"
+        if bear_early: msg += "🟠 *Early:*\n" + format_ranked_list(bear_early)
     return msg
 
 async def scan_market(session, symbols):
@@ -168,29 +162,28 @@ async def scan_market(session, symbols):
     tasks = [analyze_symbol(session, s, semaphore) for s in symbols]
     results = await asyncio.gather(*tasks)
     filtered = [r for r in results if r]
-    bullish = sorted([r for r in filtered if r[0] == "bullish"], key=lambda x: (-x[2], -x[3]))[:10]
-    bearish = sorted([r for r in filtered if r[0] == "bearish"], key=lambda x: (-x[2], -x[3]))[:10]
-    return bullish, bearish
+
+    def sort_group(trend, label):
+        return sorted(
+            [r for r in filtered if r[0] == trend and r[1] == label],
+            key=lambda x: (-x[2], -x[3])
+        )[:8]
+
+    return sort_group("bullish", "(Early)"), sort_group("bullish", "(Confirmed)"), sort_group("bearish", "(Early)"), sort_group("bearish", "(Confirmed)")
 
 async def run_scan():
     async with aiohttp.ClientSession() as session:
-        print(f"\n⏱️ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC - Scanning...")
+        print(f"\n🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC - Scanning...")
         symbols = await fetch_symbols(session)
-        bullish, bearish = await scan_market(session, symbols)
-        if bullish or bearish:
-            msg = format_report(bullish, bearish)
+        b1, b2, s1, s2 = await scan_market(session, symbols)
+        if b1 or b2 or s1 or s2:
+            msg = format_report(b1, b2, s1, s2)
             await send_telegram(session, msg)
         else:
-            await send_telegram(session, "🕵️‍♂️ No strong signals detected at this time.")
+            await send_telegram(session, "📉 *No coins matched the trend filters at this time.*")
         print("✅ Scan finished.\n")
-
-async def main():
-    try:
-        await run_scan()
-    except Exception as e:
-        print("🚨 Error:", e)
 
 if __name__ == "__main__":
     import nest_asyncio
     nest_asyncio.apply()
-    asyncio.run(main())
+    asyncio.run(run_scan())
