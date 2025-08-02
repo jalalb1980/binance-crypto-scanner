@@ -3,16 +3,14 @@ import aiohttp
 import numpy as np
 from datetime import datetime
 
-# === CONFIGURATION ===
 TELEGRAM_BOT_TOKEN = '7993511855:AAFRUpzz88JsYflrqFIbv8OlmFiNnMJ_kaQ'
 TELEGRAM_USER_ID = '7061959697'
 MAX_CONCURRENT_REQUESTS = 50
 CANDLE_LIMIT = 50
 
-# Thresholds
 MIN_SCORE_EARLY = 3
 MIN_SCORE_CONFIRMED = 4
-PRICE_CHANGE_THRESHOLD = 2.0  # +/-2%
+PRICE_CHANGE_THRESHOLD = 2.0
 VOLUME_SPIKE_RATIO = 2.0
 
 TIMEFRAMES = ["30m", "4h", "1d"]
@@ -40,7 +38,6 @@ async def send_telegram(session, text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     await session.post(url, data={"chat_id": TELEGRAM_USER_ID, "text": text, "parse_mode": "Markdown"})
 
-# === INDICATORS ===
 def calc_ema(closes, span):
     weights = np.exp(np.linspace(-1., 0., span))
     weights /= weights.sum()
@@ -106,6 +103,15 @@ def detect_momentum(closes, volumes):
     if vol_spike: score += 1
     return score, vol_spike
 
+def get_trend_direction(closes):
+    ema_fast = calc_ema(closes, 9)
+    ema_slow = calc_ema(closes, 21)
+    if ema_fast > ema_slow:
+        return 'bullish'
+    elif ema_fast < ema_slow:
+        return 'bearish'
+    return 'neutral'
+
 async def analyze_symbol(session, symbol, semaphore):
     async with semaphore:
         try:
@@ -136,6 +142,16 @@ async def analyze_symbol(session, symbol, semaphore):
             if indicator_score < MIN_SCORE_EARLY:
                 return None
 
+            # Check higher timeframe trend alignment
+            mid_trend = get_trend_direction(closes[MID_TF])
+            high_trend = get_trend_direction(closes[HIGH_TF])
+            momentum_trend = "bullish" if price_change > 0 else "bearish"
+
+            if momentum_trend == "bullish" and mid_trend == "bearish" and high_trend == "bearish":
+                return None
+            if momentum_trend == "bearish" and mid_trend == "bullish" and high_trend == "bullish":
+                return None
+
             label = None
             if indicator_score >= MIN_SCORE_CONFIRMED and abs(price_change) >= PRICE_CHANGE_THRESHOLD:
                 label = "(Confirmed)"
@@ -145,10 +161,9 @@ async def analyze_symbol(session, symbol, semaphore):
             if not label:
                 return None
 
-            trend = "bullish" if price_change > 0 else "bearish"
             indicators_fmt = " - ".join([f"{k}:{'S' if indicators_summary[k] else 'W'}" for k in indicators_summary])
             msg = f"**{symbol}** {triangle}{' (M)' if momentum_score >= 3 else ''}{' Vol↑' if vol_spike else ''} | {price_change:+.2f}% | Score:{indicator_score} | {label} | {indicators_fmt}"
-            return trend, label, indicator_score, abs(price_change), msg
+            return momentum_trend, label, indicator_score, abs(price_change), msg
         except Exception as e:
             print(f"❌ Error analyzing {symbol}: {e}")
             return None
