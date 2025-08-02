@@ -3,14 +3,16 @@ import aiohttp
 import numpy as np
 from datetime import datetime
 
+# === CONFIGURATION ===
 TELEGRAM_BOT_TOKEN = '7993511855:AAFRUpzz88JsYflrqFIbv8OlmFiNnMJ_kaQ'
 TELEGRAM_USER_ID = '7061959697'
 MAX_CONCURRENT_REQUESTS = 50
 CANDLE_LIMIT = 50
 
+# Thresholds
 MIN_SCORE_EARLY = 3
 MIN_SCORE_CONFIRMED = 4
-PRICE_CHANGE_THRESHOLD = 2.0
+PRICE_CHANGE_THRESHOLD = 2.0  # +/-2%
 VOLUME_SPIKE_RATIO = 2.0
 
 TIMEFRAMES = ["30m", "4h", "1d"]
@@ -38,6 +40,7 @@ async def send_telegram(session, text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     await session.post(url, data={"chat_id": TELEGRAM_USER_ID, "text": text, "parse_mode": "Markdown"})
 
+# === INDICATORS ===
 def calc_ema(closes, span):
     weights = np.exp(np.linspace(-1., 0., span))
     weights /= weights.sum()
@@ -119,6 +122,7 @@ async def analyze_symbol(session, symbol, semaphore):
             candles = {tf: await fetch_candles(session, symbol, tf) for tf in tfs}
             closes = {tf: [float(c[4]) for c in candles[tf]] for tf in tfs}
             volumes = [float(c[5]) for c in candles[MID_TF]]
+            last_price = closes[PRICE_TF][-1]
 
             indicators_summary = {}
             for tf in INDICATOR_TFS:
@@ -142,27 +146,38 @@ async def analyze_symbol(session, symbol, semaphore):
             if indicator_score < MIN_SCORE_EARLY:
                 return None
 
-            # Check higher timeframe trend alignment
             mid_trend = get_trend_direction(closes[MID_TF])
             high_trend = get_trend_direction(closes[HIGH_TF])
-            momentum_trend = "bullish" if price_change > 0 else "bearish"
+            overall_trend = 'mixed'
+            if mid_trend == high_trend and mid_trend in ['bullish', 'bearish']:
+                overall_trend = mid_trend
 
-            if momentum_trend == "bullish" and mid_trend == "bearish" and high_trend == "bearish":
-                return None
-            if momentum_trend == "bearish" and mid_trend == "bullish" and high_trend == "bullish":
-                return None
+            momentum_trend = 'bullish' if price_change > 0 else 'bearish'
 
             label = None
+            classification = None
+
             if indicator_score >= MIN_SCORE_CONFIRMED and abs(price_change) >= PRICE_CHANGE_THRESHOLD:
                 label = "(Confirmed)"
+                if overall_trend == 'mixed':
+                    classification = f"{momentum_trend.capitalize()} Mixed"
+                elif overall_trend == momentum_trend:
+                    classification = f"{momentum_trend.capitalize()} Strong"
+                else:
+                    classification = f"{overall_trend.capitalize()} Weak"
+
+                if momentum_score >= 3:
+                    classification += " (M)"
+
             elif indicator_score >= MIN_SCORE_EARLY and momentum_score >= 3 and abs(price_change) >= 2:
                 label = "(Early)"
+                classification = f"{momentum_trend.capitalize()} (M)"
 
-            if not label:
+            if not label or not classification:
                 return None
 
             indicators_fmt = " - ".join([f"{k}:{'S' if indicators_summary[k] else 'W'}" for k in indicators_summary])
-            msg = f"**{symbol}** {triangle}{' (M)' if momentum_score >= 3 else ''}{' Vol↑' if vol_spike else ''} | {price_change:+.2f}% | Score:{indicator_score} | {label} | {indicators_fmt}"
+            msg = f"**{symbol}** {triangle} | {price_change:+.2f}% | Price: {last_price:.2f} | Score:{indicator_score} | {label} | *{classification}* | {indicators_fmt}"
             return momentum_trend, label, indicator_score, abs(price_change), msg
         except Exception as e:
             print(f"❌ Error analyzing {symbol}: {e}")
