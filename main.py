@@ -21,7 +21,9 @@ MOMENTUM_TF = LOW_TF
 INDICATOR_TFS = [MID_TF, HIGH_TF]
 PRICE_TF = HIGH_TF
 TRIANGLE_TF = MID_TF
+STOCHRSI_TF = HIGH_TF
 
+# === UTILITIES ===
 def is_futures_usdt(symbol):
     return symbol.get('quoteAsset') == 'USDT' and symbol.get('contractType') == 'PERPETUAL'
 
@@ -81,29 +83,13 @@ def detect_triangle(candles):
         return '▲' if closes[-1] > closes[-2] else '▼'
     return '(Tx)'
 
-def stochrsi_crossover(closes, period=14):
-    rsi_vals = [rsi(closes[i:i+period]) for i in range(len(closes) - period)]
-    if len(rsi_vals) < 3:
-        return None
-    k = rsi_vals[-1]
-    d = np.mean(rsi_vals[-3:])
-    if k > d and k < 40 and d < 40:
-        return 'bullish'
-    elif k < d and k > 60 and d > 60:
-        return 'bearish'
-    return None
-
 def detect_momentum(closes, volumes):
     ema_fast = calc_ema(closes[-10:], 9)
     ema_slow = calc_ema(closes[-10:], 21)
     rsi_val = rsi(closes)
     macd = macd_hist(closes)
     vol_spike = volumes[-1] > np.mean(volumes[:-1]) * VOLUME_SPIKE_RATIO
-    score = 0
-    if ema_fast > ema_slow: score += 1
-    if rsi_val > 50: score += 1
-    if macd > 0: score += 1
-    if vol_spike: score += 1
+    score = sum([ema_fast > ema_slow, rsi_val > 50, macd > 0, vol_spike])
     return score, vol_spike
 
 def get_trend_direction(closes):
@@ -115,89 +101,67 @@ def get_trend_direction(closes):
         return 'bearish'
     return 'neutral'
 
+def stochrsi_kd(closes, period=14):
+    rsi_vals = [rsi(closes[i:i+period]) for i in range(len(closes) - period)]
+    if len(rsi_vals) < 5:
+        return None, None
+    k = rsi_vals[-1]
+    d = np.mean(rsi_vals[-3:])
+    return k, d
+
 async def analyze_symbol(session, symbol, semaphore):
     async with semaphore:
         try:
-            tfs = set(INDICATOR_TFS + [MOMENTUM_TF, PRICE_TF, TRIANGLE_TF])
+            tfs = set(INDICATOR_TFS + [MOMENTUM_TF, PRICE_TF, TRIANGLE_TF, STOCHRSI_TF])
             candles = {tf: await fetch_candles(session, symbol, tf) for tf in tfs}
             closes = {tf: [float(c[4]) for c in candles[tf]] for tf in tfs}
             volumes = [float(c[5]) for c in candles[MID_TF]]
             last_price = closes[PRICE_TF][-1]
-
-            indicators_summary = {}
-            for tf in INDICATOR_TFS:
-                ind = closes[tf]
-                indicators = {
-                    'EMA': calc_ema(ind, 9) > calc_ema(ind, 21),
-                    'RSI': rsi(ind) > 50,
-                    'MACD': macd_hist(ind) > 0,
-                    'SAR': psar(ind),
-                    'BOLL': bollinger_band(ind),
-                }
-                for k, v in indicators.items():
-                    indicators_summary[k] = indicators_summary.get(k, 0) + int(v)
-
-            indicator_score = sum(1 for v in indicators_summary.values() if v > 0)
-            momentum_score, vol_spike = detect_momentum(closes[MOMENTUM_TF], volumes)
             price_change = ((closes[PRICE_TF][-1] - closes[PRICE_TF][-2]) / closes[PRICE_TF][-2]) * 100
             triangle = detect_triangle(candles[TRIANGLE_TF])
-
-            if indicator_score < MIN_SCORE_EARLY:
-                return None
-
-            mid_trend = get_trend_direction(closes[MID_TF])
-            high_trend = get_trend_direction(closes[HIGH_TF])
-            overall_trend = 'mixed'
-            if mid_trend == high_trend and mid_trend in ['bullish', 'bearish']:
-                overall_trend = mid_trend
-
-            momentum_trend = 'bullish' if price_change > 0 else 'bearish'
+            indicator_score = sum([
+                calc_ema(closes[MID_TF], 9) > calc_ema(closes[MID_TF], 21),
+                rsi(closes[MID_TF]) > 50,
+                macd_hist(closes[MID_TF]) > 0,
+                psar(closes[MID_TF]),
+                bollinger_band(closes[MID_TF]),
+            ])
+            momentum_score, _ = detect_momentum(closes[MOMENTUM_TF], volumes)
 
             label = None
             classification = None
-
             if indicator_score >= MIN_SCORE_CONFIRMED and abs(price_change) >= PRICE_CHANGE_THRESHOLD:
                 label = "(Confirmed)"
-                classification = f"{momentum_trend.capitalize()} {'Strong' if overall_trend == momentum_trend else 'Weak'}"
-                if momentum_score >= 3:
-                    classification += " (M)"
+                classification = f"{get_trend_direction(closes[HIGH_TF]).capitalize()} (M)" if momentum_score >= 3 else get_trend_direction(closes[HIGH_TF]).capitalize()
             elif indicator_score >= MIN_SCORE_EARLY and momentum_score >= 3 and abs(price_change) >= 2:
                 label = "(Early)"
-                classification = f"{momentum_trend.capitalize()} (M)"
+                classification = f"{get_trend_direction(closes[HIGH_TF]).capitalize()} (M)"
 
-            if not label or not classification:
-                return None
+            indicators_fmt = f"EMA:{'S' if calc_ema(closes[MID_TF], 9) > calc_ema(closes[MID_TF], 21) else 'W'} - RSI:{'S' if rsi(closes[MID_TF]) > 50 else 'W'} - MACD:{'S' if macd_hist(closes[MID_TF]) > 0 else 'W'} - SAR:{'S' if psar(closes[MID_TF]) else 'W'} - BOLL:{'S' if bollinger_band(closes[MID_TF]) else 'W'}"
 
-            indicators_fmt = " - ".join([f"{k}:{'S' if indicators_summary[k] else 'W'}" for k in indicators_summary])
-            msg = f"**{symbol}** {triangle} | {price_change:+.2f}% | Price: {last_price:.2f} | Score:{indicator_score} | {label} | *{classification}* | {indicators_fmt}"
-            return momentum_trend, label, indicator_score, abs(price_change), msg
+            msg = f"**{symbol}** {triangle} | {price_change:+.2f}% | Price: {last_price:.2f} | Score:{indicator_score} | {label} | *{classification}* | {indicators_fmt}" if label and classification else None
+
+            # --- StochRSI cross detection ---
+            k, d = stochrsi_kd(closes[STOCHRSI_TF])
+            stoch_signal = None
+            if k and d:
+                if k > d and k < 40:
+                    stoch_signal = ("bullish", price_change, f"**{symbol}** | {price_change:+.2f}% | K:{k:.2f} > D:{d:.2f}")
+                elif k < d and k > 60:
+                    stoch_signal = ("bearish", price_change, f"**{symbol}** | {price_change:+.2f}% | K:{k:.2f} < D:{d:.2f}")
+
+            return (get_trend_direction(closes[HIGH_TF]), label, indicator_score, abs(price_change), msg), stoch_signal
         except Exception as e:
             print(f"❌ Error analyzing {symbol}: {e}")
-            return None
-
-async def scan_stochrsi(session, symbols):
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-    results = []
-
-    async def task(symbol):
-        async with semaphore:
-            try:
-                candles = await fetch_candles(session, symbol, "4h")
-                closes = [float(c[4]) for c in candles]
-                signal = stochrsi_crossover(closes)
-                if signal:
-                    return f"**{symbol}** | StochRSI: *{signal.capitalize()}*"
-            except:
-                return None
-
-    tasks = [task(s) for s in symbols]
-    raw = await asyncio.gather(*tasks)
-    return sorted([r for r in raw if r])[:10]
+            return None, None
 
 def format_ranked_list(entries):
     return "\n\n".join([f"{i+1}. {entry[4]}" for i, entry in enumerate(entries)])
 
-def format_report(bull_early, bull_conf, bear_early, bear_conf, stoch_signals):
+def format_stochrsi_list(entries):
+    return "\n\n".join([f"{i+1}. {entry[2]}" for i, entry in enumerate(entries)])
+
+def format_report(bull_early, bull_conf, bear_early, bear_conf, stoch_bull, stoch_bear):
     msg = "*📊 Binance Futures Trend Scanner*\n\n"
     if bull_conf or bull_early:
         msg += "🚀 *Bullish Signals:*\n"
@@ -211,34 +175,44 @@ def format_report(bull_early, bull_conf, bear_early, bear_conf, stoch_signals):
             msg += "🔴 *Confirmed:*\n" + format_ranked_list(bear_conf) + "\n\n"
         if bear_early:
             msg += "🟠 *Early:*\n" + format_ranked_list(bear_early) + "\n\n"
-    if stoch_signals:
-        msg += "📈 *StochRSI Crossover Signals:*\n" + "\n".join(stoch_signals)
+    if stoch_bull or stoch_bear:
+        msg += "📈 *StochRSI Signals:*\n"
+        if stoch_bull:
+            msg += "🔼 *Bullish:* \n" + format_stochrsi_list(stoch_bull) + "\n\n"
+        if stoch_bear:
+            msg += "🔽 *Bearish:* \n" + format_stochrsi_list(stoch_bear)
     return msg
 
 async def scan_market(session, symbols):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     tasks = [analyze_symbol(session, s, semaphore) for s in symbols]
     results = await asyncio.gather(*tasks)
-    filtered = [r for r in results if r]
+    main_signals = [r[0] for r in results if r[0]]
+    stoch_signals = [r[1] for r in results if r[1]]
 
     def filter_and_sort(trend, label):
-        return sorted([r for r in filtered if r[0] == trend and r[1] == label], key=lambda x: (-x[2], -x[3]))[:10]
+        return sorted([r for r in main_signals if r[0] == trend and r[1] == label], key=lambda x: (-x[2], -x[3]))[:10]
 
     bull_conf = filter_and_sort("bullish", "(Confirmed)")
     bull_early = filter_and_sort("bullish", "(Early)")
     bear_conf = filter_and_sort("bearish", "(Confirmed)")
     bear_early = filter_and_sort("bearish", "(Early)")
 
-    return bull_early, bull_conf, bear_early, bear_conf
+    stoch_bull = sorted([s for s in stoch_signals if s[0] == "bullish"], key=lambda x: -x[1])[:10]
+    stoch_bear = sorted([s for s in stoch_signals if s[0] == "bearish"], key=lambda x: x[1])[:10]
+
+    return bull_early, bull_conf, bear_early, bear_conf, stoch_bull, stoch_bear
 
 async def run_scan():
     async with aiohttp.ClientSession() as session:
         print(f"\n⏱️ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC - Scanning...")
         symbols = await fetch_symbols(session)
-        bull_early, bull_conf, bear_early, bear_conf = await scan_market(session, symbols)
-        stoch_signals = await scan_stochrsi(session, symbols)
-        msg = format_report(bull_early, bull_conf, bear_early, bear_conf, stoch_signals)
-        await send_telegram(session, msg if msg else "*📊 No signals detected.*")
+        bull_early, bull_conf, bear_early, bear_conf, stoch_bull, stoch_bear = await scan_market(session, symbols)
+        if any([bull_early, bull_conf, bear_early, bear_conf, stoch_bull, stoch_bear]):
+            msg = format_report(bull_early, bull_conf, bear_early, bear_conf, stoch_bull, stoch_bear)
+            await send_telegram(session, msg)
+        else:
+            await send_telegram(session, "*📊 No coins match filter criteria at the moment.*")
         print("✅ Scan finished.\n")
 
 async def main():
