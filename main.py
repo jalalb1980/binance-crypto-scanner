@@ -87,9 +87,9 @@ def stochrsi_crossover(closes, period=14):
         return None
     k = rsi_vals[-1]
     d = np.mean(rsi_vals[-3:])
-    if k > d and k < 20 and d < 20:
+    if k > d and k < 40 and d < 40:
         return 'bullish'
-    elif k < d and k > 80 and d > 80:
+    elif k < d and k > 60 and d > 60:
         return 'bearish'
     return None
 
