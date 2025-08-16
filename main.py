@@ -9,33 +9,33 @@ from math import isfinite
 TELEGRAM_BOT_TOKEN = '7993511855:AAFRUpzz88JsYflrqFIbv8OlmFiNnMJ_kaQ'
 TELEGRAM_USER_ID = '7061959697'
 
-MAX_CONCURRENT_REQUESTS = 20
+MAX_CONCURRENT_REQUESTS = 20          # stable + fast (avoid 418s)
 HTTP_TIMEOUT = 15
 RETRY_ATTEMPTS = 3
 CANDLE_LIMIT = 200
 
-# Prefilter: scan only top-N by 24h quote volume (set to None to scan all)
+# Scan only top-N by 24h quote volume (set to None to scan all)
 TOP_N_BY_VOLUME = 120
 
-# Thresholds
+# Thresholds (shared by both sides)
 MIN_SCORE_EARLY = 3
 MIN_SCORE_CONFIRMED = 4
-PRICE_CHANGE_THRESHOLD = 2.0
+PRICE_CHANGE_THRESHOLD = 2.0          # +/-2%
 VOLUME_SPIKE_RATIO = 2.0
 
 TIMEFRAMES = ["30m", "4h", "1d"]
 LOW_TF, MID_TF, HIGH_TF = TIMEFRAMES
-MOMENTUM_TF = LOW_TF
-INDICATOR_TFS = [MID_TF, HIGH_TF]
+MOMENTUM_TF = LOW_TF                   # momentum on fast TF
+INDICATOR_TFS = [MID_TF, HIGH_TF]      # signals must align across these
 PRICE_TF = HIGH_TF
 TRIANGLE_TF = MID_TF
 
-# StochRSI list
+# --- StochRSI crossover section (separate list) ---
 STOCH_TF = HIGH_TF
-STOCH_BEAR_MIN_DROP = 2.0
-STOCH_BULL_MIN_RISE = 2.0
+STOCH_BEAR_MIN_DROP = 2.0  # Bearish Stoch list must have price change <= -2%
+STOCH_BULL_MIN_RISE = 2.0  # Bullish Stoch list must have price change >= +2%
 
-# Strategy tag toggles
+# Strategy tags (informational only)
 USE_LTR = True
 USE_TBB = True
 USE_VSQ = True
@@ -43,7 +43,7 @@ USE_AVWAP = True
 
 EPS = 1e-12
 
-# --- Hosts / Headers ---
+# --- Hosts / Headers (keep-alive + failover to reduce 418s) ---
 BINANCE_FAPI_HOSTS = [
     "https://fapi.binance.com",
     "https://fapi.binancefuture.com",
@@ -56,7 +56,7 @@ SESSION_HEADERS = {
     "Connection": "keep-alive",
 }
 
-# Cache for candles within a single run
+# Candle cache per run
 CANDLE_CACHE = {}
 
 # === HELPERS ===
@@ -78,9 +78,8 @@ async def fetch_json(session, url):
             async with session.get(u, timeout=HTTP_TIMEOUT) as res:
                 if res.status in (418, 429, 451, 403, 409):
                     others = [h for h in BINANCE_FAPI_HOSTS if h != BASE_HOST]
-                    if others:
-                        BASE_HOST = random.choice(others)
-                    await asyncio.sleep(1.0 + attempt * 0.5)
+                    if others: BASE_HOST = random.choice(others)
+                    await asyncio.sleep(1.0 + 0.5*attempt)
                     last_exc = f"HTTP {res.status}"
                     continue
                 if res.status == 200:
@@ -88,7 +87,7 @@ async def fetch_json(session, url):
                 last_exc = f"HTTP {res.status}"
         except Exception as e:
             last_exc = e
-        await asyncio.sleep(0.2 + attempt * 0.3)
+        await asyncio.sleep(0.2 + 0.3*attempt)
     raise RuntimeError(f"GET failed: {url} -> {last_exc}")
 
 async def choose_base_host(session):
@@ -100,7 +99,7 @@ async def choose_base_host(session):
                     BASE_HOST = host
                     return
         except:
-            continue
+            pass
     BASE_HOST = BINANCE_FAPI_HOSTS[0]
 
 async def fetch_symbols(session):
@@ -113,10 +112,8 @@ async def prefilter_top_by_volume(session, symbols, top_n=TOP_N_BY_VOLUME):
     data = await fetch_json(session, f"{BASE_HOST}/fapi/v1/ticker/24hr")
     rows = [d for d in data if d.get('symbol') in symbols]
     def qv(d):
-        try:
-            return float(d.get('quoteVolume') or 0.0)
-        except:
-            return 0.0
+        try: return float(d.get('quoteVolume') or 0.0)
+        except: return 0.0
     rows.sort(key=qv, reverse=True)
     picks = [d['symbol'] for d in rows[:top_n]]
     return picks if picks else symbols
@@ -138,52 +135,45 @@ def to_ohlcv(candles):
     v = np.array([float(x[5]) for x in candles], dtype=float)
     return o, h, l, c, v
 
-# === INDICATORS ===
+# === INDICATORS (robust, no external libs) ===
 def ema(arr, period):
     arr = np.asarray(arr, dtype=float)
-    if len(arr) == 0 or period <= 0:
-        return np.array([])
+    if len(arr) == 0 or period <= 0: return np.array([])
     alpha = 2.0 / (period + 1.0)
-    out = np.empty_like(arr)
-    out[0] = arr[0]
-    for i in range(1, len(arr)):
-        out[i] = alpha * arr[i] + (1 - alpha) * out[i-1]
+    out = np.empty_like(arr); out[0] = arr[0]
+    for i in range(1, len(arr)): out[i] = alpha * arr[i] + (1 - alpha) * out[i-1]
     return out
 
 def rsi_wilder(closes, period=14):
     c = np.asarray(closes, dtype=float)
-    if len(c) < period + 1:
-        return np.array([])
-    delta = np.diff(c)
-    gain = np.where(delta > 0, delta, 0.0)
-    loss = np.where(delta < 0, -delta, 0.0)
-    avg_gain = np.empty(len(delta)); avg_loss = np.empty(len(delta))
-    avg_gain[:period] = np.nan;       avg_loss[:period] = np.nan
-    avg_gain[period-1] = gain[:period].mean()
-    avg_loss[period-1] = loss[:period].mean()
-    for i in range(period, len(delta)):
-        avg_gain[i] = (avg_gain[i-1]*(period-1) + gain[i]) / period
-        avg_loss[i] = (avg_loss[i-1]*(period-1) + loss[i]) / period
-    rs = avg_gain / np.maximum(avg_loss, EPS)
-    rs[~np.isfinite(rs)] = 0.0
+    if len(c) < period + 1: return np.array([])
+    d = np.diff(c)
+    gain = np.where(d > 0, d, 0.0); loss = np.where(d < 0, -d, 0.0)
+    ag = np.empty(len(d)); al = np.empty(len(d))
+    ag[:period] = np.nan; al[:period] = np.nan
+    ag[period-1] = gain[:period].mean(); al[period-1] = loss[:period].mean()
+    for i in range(period, len(d)):
+        ag[i] = (ag[i-1]*(period-1) + gain[i]) / period
+        al[i] = (al[i-1]*(period-1) + loss[i]) / period
+    rs = ag / np.maximum(al, EPS); rs[~np.isfinite(rs)] = 0.0
     rsi = 100.0 - (100.0 / (1.0 + rs))
-    rsi = np.concatenate(([np.nan], rsi))
-    return rsi
+    return np.concatenate(([np.nan], rsi))
 
 def macd_histogram(closes, fast=12, slow=26, signal=9):
     c = np.asarray(closes, dtype=float)
     if len(c) < slow + signal + 5: return np.nan
-    ema_fast = ema(c, fast); ema_slow = ema(c, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = ema(macd_line, signal)
+    ef = ema(c, fast); es = ema(c, slow)
+    macd_line = ef - es; signal_line = ema(macd_line, signal)
     return float((macd_line - signal_line)[-1])
 
-def bollinger_bands_signal(closes, period=20, dev=2.0):
+def bollinger_band_signed(closes, period=20, dev=2.0):
     c = np.asarray(closes, dtype=float)
-    if len(c) < period: return False
+    if len(c) < period: return 0
     ma = c[-period:].mean(); sd = c[-period:].std(ddof=0)
     upper = ma + dev*sd; lower = ma - dev*sd
-    return bool(c[-1] > upper or c[-1] < lower)
+    if c[-1] > upper: return +1
+    if c[-1] < lower: return -1
+    return 0
 
 def psar_signal(highs, lows, closes, af_step=0.02, af_max=0.2):
     h = np.asarray(highs, dtype=float)
@@ -194,51 +184,58 @@ def psar_signal(highs, lows, closes, af_step=0.02, af_max=0.2):
     uptrend = c[1] > c[0]
     ep = h[0] if uptrend else l[0]; af = af_step; psar = c[0]
     for i in range(1, n):
-        prev_psar = psar
+        prev = psar
         if uptrend:
-            psar = prev_psar + af * (ep - prev_psar)
+            psar = prev + af * (ep - prev)
             psar = min(psar, l[i-1], l[i-2] if i >= 2 else l[i-1])
             if h[i] > ep: ep = h[i]; af = min(af + af_step, af_max)
             if l[i] < psar: uptrend=False; psar=ep; ep=l[i]; af=af_step
         else:
-            psar = prev_psar + af * (ep - prev_psar)
+            psar = prev + af * (ep - prev)
             psar = max(psar, h[i-1], h[i-2] if i >= 2 else h[i-1])
             if l[i] < ep: ep=l[i]; af=min(af + af_step, af_max)
             if h[i] > psar: uptrend=True; psar=ep; ep=h[i]; af=af_step
-    return bool(c[-1] > psar)
+    return bool(c[-1] > psar)  # True=above (bullish), False=below (bearish)
 
 def stoch_rsi_signal(closes, period=14):
     r = rsi_wilder(closes, period)
     valid = r[~np.isnan(r)]
     if len(valid) < period + 3: return None
-    rsi_window = valid[-period:]
-    rmin = np.min(rsi_window); rmax = np.max(rsi_window)
-    denom = max(rmax - rmin, EPS)
-    k = (valid[-1] - rmin) / denom * 100.0
-    k_series = []
-    for back in range(3, 0, -1):
-        win = valid[-(period + (3 - back)) : -(3 - back) if (3 - back) != 0 else None]
-        if len(win) < period: k_series.append(k); continue
-        rmin_b = np.min(win[-period:]); rmax_b = np.max(win[-period:])
-        denom_b = max(rmax_b - rmin_b, EPS)
-        k_series.append((win[-1] - rmin_b) / denom_b * 100.0)
-    d = float(np.mean(k_series)); diff = abs(k - d)
+    win = valid[-period:]; rmin = np.min(win); rmax = np.max(win)
+    k = (valid[-1] - rmin) / max(rmax - rmin, EPS) * 100.0
+    # simple D as mean of last 3 K approximations
+    ks = [k]
+    for back in (1,2):
+        w = valid[-(period+back):-back]
+        if len(w) >= period:
+            rmin_b, rmax_b = np.min(w[-period:]), np.max(w[-period:])
+            ks.append((w[-1] - rmin_b)/max(rmax_b - rmin_b, EPS)*100.0)
+    d = float(np.mean(ks))
+    diff = abs(k - d)
     signal = 'bullish' if (k > d and k < 40) else ('bearish' if (k < d and k > 60) else None)
     level = 'Hot' if diff <= 3 else 'Good' if diff <= 15 else 'Normal'
     return signal, diff, level, k, d
 
-def indicator_bundle(highs, lows, closes):
-    ema_fast_up = ema(closes, 9); ema_slow_up = ema(closes, 21)
-    ema_ok = bool(ema_fast_up.size and ema_slow_up.size and ema_fast_up[-1] > ema_slow_up[-1])
-    rsi_arr = rsi_wilder(closes, 14)
-    rsi_ok = bool(rsi_arr.size and isfinite(rsi_arr[-1]) and rsi_arr[-1] > 50)
-    mh = macd_histogram(closes); macd_ok = bool(isfinite(mh) and mh > 0)
-    sar_ok = psar_signal(highs, lows, closes)
-    boll_ok = bollinger_bands_signal(closes)
-    stoch = stoch_rsi_signal(closes); stoch_ok = (stoch[0] == 'bullish') if stoch else False
-    return {'EMA': ema_ok,'RSI': rsi_ok,'MACD': macd_ok,'SAR': sar_ok,'BOLL': boll_ok,'STOCH': stoch_ok}
+# --- side-aware indicator voting (bullish=+1, bearish=−1) ---
+def indicator_votes(highs, lows, closes):
+    votes = {}
+    e9 = ema(closes, 9); e21 = ema(closes, 21)
+    votes['EMA']  = +1 if (len(e9) and len(e21) and e9[-1] > e21[-1]) else (-1 if (len(e9) and len(e21) and e9[-1] < e21[-1]) else 0)
 
-# === THESE TWO MUST EXIST BEFORE analyze_symbol ===
+    r = rsi_wilder(closes, 14)
+    r_last = r[-1] if r.size else np.nan
+    votes['RSI']  = +1 if (np.isfinite(r_last) and r_last > 50) else (-1 if (np.isfinite(r_last) and r_last < 50) else 0)
+
+    m = macd_histogram(closes)
+    votes['MACD'] = +1 if (isfinite(m) and m > 0) else (-1 if (isfinite(m) and m < 0) else 0)
+
+    votes['SAR']  = +1 if psar_signal(highs, lows, closes) else -1
+    votes['BOLL'] = bollinger_band_signed(closes)
+
+    st = stoch_rsi_signal(closes)
+    votes['STOCH'] = (+1 if st and st[0] == 'bullish' else (-1 if st and st[0] == 'bearish' else 0))
+    return votes
+
 def get_trend_direction(closes):
     e9 = ema(closes, 9); e21 = ema(closes, 21)
     if len(e9) == 0 or len(e21) == 0: return 'neutral'
@@ -246,20 +243,26 @@ def get_trend_direction(closes):
     if e9[-1] < e21[-1]: return 'bearish'
     return 'neutral'
 
-def detect_momentum(closes, volumes):
+def momentum_score_for_side(closes, volumes, side):
+    # 4-point momentum score aligned to side
     e9 = ema(closes, 9); e21 = ema(closes, 21)
-    rsi_arr = rsi_wilder(closes, 14)
+    rsi_arr = rsi_wilder(closes, 14); r = rsi_arr[-1] if rsi_arr.size else np.nan
     macd_h = macd_histogram(closes)
-    if len(e9) < 1 or len(e21) < 1 or len(rsi_arr) < 1: return 0, False
     vol_spike = volumes[-1] > (np.mean(volumes[-20:-1]) + EPS) * VOLUME_SPIKE_RATIO if len(volumes) > 20 else False
-    score = 0
-    if e9[-1] > e21[-1]: score += 1
-    if rsi_arr[-1] > 50: score += 1
-    if isfinite(macd_h) and macd_h > 0: score += 1
-    if vol_spike: score += 1
-    return score, vol_spike
 
-# === TAGS (optional) ===
+    score = 0
+    if side == 'bullish':
+        if len(e9) and len(e21) and e9[-1] > e21[-1]: score += 1
+        if np.isfinite(r) and r > 50: score += 1
+        if isfinite(macd_h) and macd_h > 0: score += 1
+    else:
+        if len(e9) and len(e21) and e9[-1] < e21[-1]: score += 1
+        if np.isfinite(r) and r < 50: score += 1
+        if isfinite(macd_h) and macd_h < 0: score += 1
+    if vol_spike: score += 1
+    return score
+
+# === TAGS (optional info) ===
 def detect_triangle_tag(closes, highs, lows, lookback=30, tight=0.02):
     if len(closes) < lookback: return '(Tx)'
     hb = float(np.max(highs[-lookback:])); lb = float(np.min(lows[-lookback:]))
@@ -271,13 +274,13 @@ def detect_triangle_tag(closes, highs, lows, lookback=30, tight=0.02):
 
 def tag_liquidity_trap_reversal(closes, highs, lows, volumes):
     if not USE_LTR or len(closes) < 6: return None
-    range_hl = highs[-1] - lows[-1]
-    if range_hl <= 0: return None
+    rng = highs[-1] - lows[-1]
+    if rng <= 0: return None
     vol_spike = volumes[-1] > (np.mean(volumes[-20:-1]) + EPS) * 2.0 if len(volumes) > 20 else False
     tail = closes[-1] - lows[-1]
-    if (tail / max(range_hl, EPS) > 0.6) and vol_spike: return 'LTR▲'
-    upper_wick = highs[-1] - closes[-1]
-    if (upper_wick / max(range_hl, EPS) > 0.6) and vol_spike: return 'LTR▼'
+    if (tail / max(rng, EPS) > 0.6) and vol_spike: return 'LTR▲'
+    upper = highs[-1] - closes[-1]
+    if (upper / max(rng, EPS) > 0.6) and vol_spike: return 'LTR▼'
     return None
 
 def tag_time_based_breakout(closes, opens, volumes, timestamps=None, compress_len=20, width_pct=0.01):
@@ -302,55 +305,79 @@ def tag_volatility_squeeze(closes, period=20, dev=2.0, pct_thresh=0.08):
 
 def tag_avwap_reclaim(closes, highs, lows, anchor_lookback=60):
     if not USE_AVWAP or len(closes) < anchor_lookback + 5: return None
-    swing_low_idx = np.argmin(lows[-anchor_lookback:])
-    swing_high_idx = np.argmax(highs[-anchor_lookback:])
+    sl = np.argmin(lows[-anchor_lookback:]); sh = np.argmax(highs[-anchor_lookback:])
     def avwap_from(idx):
         start = len(closes) - anchor_lookback + idx
         c = np.array(closes[start:], dtype=float); v = np.ones_like(c)
         return float(np.sum(c * v) / np.sum(v))
-    avwap_low = avwap_from(swing_low_idx); avwap_high = avwap_from(swing_high_idx)
+    avwap_low = avwap_from(sl); avwap_high = avwap_from(sh)
     if closes[-1] > avwap_low and closes[-2] <= avwap_low: return 'AVWAP▲'
     if closes[-1] < avwap_high and closes[-2] >= avwap_high: return 'AVWAP▼'
     return None
 
 # === ACTION HINT ===
-def derive_action(overall_trend, label, strength, momentum_score):
+def derive_action(overall_trend, label, strength):
     if overall_trend == 'bullish':
-        if label == "(Confirmed)": return "LONG (A)" if strength == "Strong" else "LONG (B)"
-        return "LONG (B)"
+        return "LONG (A)" if (label == "(Confirmed)" and strength == "Strong") else "LONG (B)"
     else:
-        if label == "(Confirmed)": return "SHORT (A)" if strength == "Strong" else "SHORT (B)"
-        return "SHORT (B)"
+        return "SHORT (A)" if (label == "(Confirmed)" and strength == "Strong") else "SHORT (B)"
 
 # === ANALYSIS ===
 async def analyze_symbol(session, symbol, semaphore):
     async with semaphore:
         try:
+            # fetch all needed TF candles (include STOCH_TF so we don't refetch)
             tfs = list(set(INDICATOR_TFS + [MOMENTUM_TF, PRICE_TF, TRIANGLE_TF, STOCH_TF]))
-            tasks = [fetch_candles(session, symbol, tf) for tf in tfs]
-            fetched = await asyncio.gather(*tasks, return_exceptions=True)
+            fetched = await asyncio.gather(*[fetch_candles(session, symbol, tf) for tf in tfs], return_exceptions=True)
             candles = {}
             for tf, data in zip(tfs, fetched):
                 if isinstance(data, Exception): return None
                 candles[tf] = data
 
-            series = {}
-            for tf in tfs:
-                o,h,l,c,v = to_ohlcv(candles[tf])
-                series[tf] = {'o':o,'h':h,'l':l,'c':c,'v':v}
+            series = {tf: dict(zip(['o','h','l','c','v'], to_ohlcv(candles[tf]))) for tf in tfs}
 
             last_price = float(series[PRICE_TF]['c'][-1])
             price_change = (series[PRICE_TF]['c'][-1] - series[PRICE_TF]['c'][-2]) / max(series[PRICE_TF]['c'][-2], EPS) * 100.0
 
-            indicators_summary = {}
+            # Require MID & HIGH trends to agree (pure lists)
+            mid_trend  = get_trend_direction(series[MID_TF]['c'])
+            high_trend = get_trend_direction(series[HIGH_TF]['c'])
+            if mid_trend == high_trend and mid_trend in ('bullish','bearish'):
+                overall_trend = mid_trend
+            else:
+                return None
+
+            # Aggregate indicator votes across 4h + 1d (signed)
+            agg = {k: 0 for k in ['EMA','RSI','MACD','SAR','BOLL','STOCH']}
             for tf in INDICATOR_TFS:
-                ind = indicator_bundle(series[tf]['h'], series[tf]['l'], series[tf]['c'])
-                for k, v in ind.items():
-                    indicators_summary[k] = indicators_summary.get(k, 0) + (1 if v else 0)
-            indicator_score = sum(1 for v in indicators_summary.values() if v > 0)
+                v = indicator_votes(series[tf]['h'], series[tf]['l'], series[tf]['c'])
+                for k, val in v.items():
+                    agg[k] += val
 
-            momentum_score, _ = detect_momentum(series[MOMENTUM_TF]['c'], series[MOMENTUM_TF]['v'])
+            bullish_score = sum(1 for v in agg.values() if v > 0)
+            bearish_score = sum(1 for v in agg.values() if v < 0)
+            side_score = bullish_score if overall_trend == 'bullish' else abs(bearish_score)
 
+            # Momentum aligned to the same side (on 30m)
+            mom_score = momentum_score_for_side(series[MOMENTUM_TF]['c'], series[MOMENTUM_TF]['v'], overall_trend)
+            momentum_trend = 'bullish' if price_change > 0 else 'bearish'
+            strength = "Strong" if momentum_trend == overall_trend else "Weak"
+
+            # Labels (same thresholds for both sides)
+            label = None; classification = None
+            if side_score >= MIN_SCORE_CONFIRMED and abs(price_change) >= PRICE_CHANGE_THRESHOLD:
+                label = "(Confirmed)"
+                classification = f"{overall_trend.capitalize()} {strength}"
+                if mom_score >= 3 and strength == "Strong":
+                    classification += " (M)"
+            elif side_score >= MIN_SCORE_EARLY and mom_score >= 3 and abs(price_change) >= 2:
+                label = "(Early)"
+                classification = f"{overall_trend.capitalize()} (M)"
+
+            if not label:
+                return None
+
+            # Tags (informational)
             tri = detect_triangle_tag(series[TRIANGLE_TF]['c'], series[TRIANGLE_TF]['h'], series[TRIANGLE_TF]['l'])
             tags = []
             for t in (
@@ -362,36 +389,20 @@ async def analyze_symbol(session, symbol, semaphore):
                 if t: tags.append(t)
             tag_str = (" [" + ",".join(tags) + "]") if tags else ""
 
-            mid_trend  = get_trend_direction(series[MID_TF]['c'])
-            high_trend = get_trend_direction(series[HIGH_TF]['c'])
-            if mid_trend == high_trend and mid_trend in ('bullish','bearish'):
-                overall_trend = mid_trend
-            else:
-                return None
+            # Format indicators S/W relative to the side
+            def side_str(k):
+                val = agg[k]
+                return 'S' if ((val > 0 and overall_trend == 'bullish') or (val < 0 and overall_trend == 'bearish')) else 'W'
+            indicators_fmt = " - ".join([f"{k}:{side_str(k)}" for k in ['EMA','RSI','MACD','SAR','BOLL','STOCH']])
 
-            momentum_trend = 'bullish' if price_change > 0 else 'bearish'
+            action = derive_action(overall_trend, label, strength)
 
-            label = None; classification = None; strength = None
-            if indicator_score >= MIN_SCORE_CONFIRMED and abs(price_change) >= PRICE_CHANGE_THRESHOLD:
-                label = "(Confirmed)"
-                strength = "Strong" if momentum_trend == overall_trend else "Weak"
-                classification = f"{overall_trend.capitalize()} {strength}"
-                if momentum_score >= 3 and strength == "Strong":
-                    classification += " (M)"
-            elif indicator_score >= MIN_SCORE_EARLY and momentum_score >= 3 and abs(price_change) >= 2:
-                label = "(Early)"
-                strength = "Weak"
-                classification = f"{overall_trend.capitalize()} (M)"
-            if not label: return None
-
-            action = derive_action(overall_trend, label, strength, momentum_score)
-
-            indicators_fmt = " - ".join([f"{k}:{'S' if indicators_summary[k] else 'W'}" for k in ['EMA','RSI','MACD','SAR','BOLL','STOCH']])
             msg = (
                 f"**{symbol}** {tri}{tag_str} | {price_change:+.2f}% | Price: {last_price:.6g} | "
-                f"Score:{indicator_score} | {label} | *{classification}* | {indicators_fmt} | Action: {action}"
+                f"Score:{side_score} | {label} | *{classification}* | {indicators_fmt} | Action: {action}"
             )
 
+            # StochRSI crossover (reuse fetched candles)
             stoch = stoch_rsi_signal(series[STOCH_TF]['c'])
             stoch_entry = None
             if stoch:
@@ -400,7 +411,9 @@ async def analyze_symbol(session, symbol, semaphore):
                 lab = f"**{symbol}** | {pc:+.2f}% | {sgn.upper()} | K:{k:.1f} D:{d:.1f} | Δ:{diff:.2f} | 🔥 {level}"
                 stoch_entry = (sgn, pc, lab)
 
-            return (overall_trend, label, indicator_score, abs(price_change), msg), stoch_entry
+            # Return trend result + optional stoch result
+            return (overall_trend, label, side_score, abs(price_change), msg), stoch_entry
+
         except Exception as e:
             print(f"❌ Error analyzing {symbol}: {e}")
             return None
@@ -413,8 +426,7 @@ def format_stoch_list(entries):
 
 async def scan_market(session, symbols):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-    tasks = [analyze_symbol(session, s, semaphore) for s in symbols]
-    results = await asyncio.gather(*tasks)
+    results = await asyncio.gather(*[analyze_symbol(session, s, semaphore) for s in symbols])
 
     trend_items, stoch_items = [], []
     for r in results:
@@ -461,8 +473,7 @@ async def send_telegram(session, text):
     for _ in range(RETRY_ATTEMPTS):
         try:
             async with session.post(url, data=payload, timeout=HTTP_TIMEOUT) as res:
-                if res.status == 200:
-                    return True
+                if res.status == 200: return True
         except Exception:
             await asyncio.sleep(0.2)
     return False
@@ -483,9 +494,6 @@ async def run_scan():
 
 async def main():
     try:
-        # quick sanity check
-        if not callable(detect_momentum) or not callable(get_trend_direction):
-            print("⚠️ Sanity check failed: missing detect_momentum/get_trend_direction.")
         await run_scan()
     except Exception as e:
         print("🚨 Error:", e)
