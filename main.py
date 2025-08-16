@@ -256,7 +256,6 @@ def stoch_rsi_signal(closes, period=14):
     level = 'Hot' if diff <= 3 else 'Good' if diff <= 15 else 'Normal'
     return signal, diff, level, k, d
 
-# >>> MISSING BEFORE: now included <<<
 def indicator_bundle(highs, lows, closes):
     """Boolean signals for EMA/RSI/MACD/PSAR/BOLL/STOCH on a single TF."""
     ema_fast_up = ema(closes, 9)
@@ -277,6 +276,34 @@ def indicator_bundle(highs, lows, closes):
     stoch_ok = (stoch_sig == 'bullish')
 
     return {'EMA': ema_ok, 'RSI': rsi_ok, 'MACD': macd_ok, 'SAR': sar_ok, 'BOLL': boll_ok, 'STOCH': stoch_ok}
+
+# >>> ADDED NOW <<<
+def get_trend_direction(closes):
+    e9 = ema(closes, 9); e21 = ema(closes, 21)
+    if len(e9) == 0 or len(e21) == 0:
+        return 'neutral'
+    if e9[-1] > e21[-1]:
+        return 'bullish'
+    if e9[-1] < e21[-1]:
+        return 'bearish'
+    return 'neutral'
+
+# >>> ADDED NOW <<<
+def detect_momentum(closes, volumes):
+    e9 = ema(closes, 9); e21 = ema(closes, 21)
+    rsi_arr = rsi_wilder(closes, 14)
+    macd_h = macd_histogram(closes)
+    if len(e9) < 1 or len(e21) < 1 or len(rsi_arr) < 1:
+        return 0, False
+    vol_spike = False
+    if len(volumes) > 20:
+        vol_spike = volumes[-1] > (np.mean(volumes[-20:-1]) + EPS) * VOLUME_SPIKE_RATIO
+    score = 0
+    if e9[-1] > e21[-1]: score += 1
+    if rsi_arr[-1] > 50: score += 1
+    if isfinite(macd_h) and macd_h > 0: score += 1
+    if vol_spike: score += 1
+    return score, vol_spike
 
 # === PATTERN / STRATEGY TAGS (informational only) ===
 def detect_triangle_tag(closes, highs, lows, lookback=30, tight=0.02):
